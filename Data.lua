@@ -1,5 +1,5 @@
 SpellTipsData = {}
-SpellTipsData.Build = { build = "70291", generated = "2026-10-08" }
+SpellTipsData.Build = { build = "", generated = "2026-10-10" }
 SpellTipsData.AddonData = {
     [1] = { name = "Word of Recall (OLD)", classSet = 0, si = 4, lines = {[0] = { base = 3, percent = "100.00%", coeff = 1, per = 0, var = 1.66667, type = 252 }}, talents = {} },
     [4] = { name = "Word of Recall Other", classSet = 0, si = 1, lines = {[0] = { base = 3, percent = "100.00%", coeff = 1, per = 0, var = 1.66667, type = 252 }}, talents = {} },
