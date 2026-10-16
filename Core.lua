@@ -34,6 +34,11 @@ local COLOR = {
 -- no Lua enum; the weapon slots and the dagger subclass are looked up from the game where it provides them.
 local EFFECT = { SCHOOL_DAMAGE = 2, HEAL = 10, WEAPON_PERCENT = 31, WEAPON_DAMAGE = 58,
                  WEAPON_DAMAGE_NO_SCHOOL = 17, NORMALIZED_WEAPON = 121 }
+-- Forever shrinks the spell-power bonus of healing ranks far below your level: the bonus is multiplied by
+-- 1 - 0.05 * (level - maxLevel - 12), kept between 0 and 1, where maxLevel is the rank's own "MaxLevel" from the
+-- game data. Measured on a level 27 druid (Healing Touch, Rejuvenation, Regrowth); Blizzard has not published it.
+-- Damage spells showed no penalty in the game's own descriptions, so it is not applied to them.
+local RANK_PENALTY_STEP, RANK_PENALTY_GRACE = 0.05, 12
 local AURA = { HEAL_OVER_TIME = 8, MOD_THREAT = 10, PERCENT_DAMAGE = 79, FLAT_MOD = 107, PERCENT_MOD = 108 }
 local SLOT_MAINHAND, SLOT_RANGED = 16, 18
 local DAGGER = (Enum and Enum.ItemWeaponSubclass and Enum.ItemWeaponSubclass.Dagger) or 15
@@ -247,15 +252,25 @@ local function SpellPowerFor(spellData, line)
     return ReadLive("damage" .. school, GetSpellBonusDamage, school) or 0
 end
 
--- spell damage: scaled base * (1 +/- variance/2) + coefficient * spellpower
+-- Share of the spell-power bonus a healing rank keeps at your level (1 = all of it).
+local function RankFactor(spellData, line)
+    local maxLevel = spellData.maxLevel or 0
+    if maxLevel <= 0 or not (line.type == EFFECT.HEAL or line.aura == AURA.HEAL_OVER_TIME) then return 1 end
+    local over = (UnitLevel("player") or 1) - maxLevel - RANK_PENALTY_GRACE
+    return math.min(1, math.max(0, 1 - over * RANK_PENALTY_STEP))
+end
+
+-- spell damage: scaled base * (1 +/- variance/2) + coefficient * spellpower * rank factor
 local function PredictRange(spellData, line)
     local scaled = ScaledBase(spellData, line)
     local sp = SpellPowerFor(spellData, line)
+    local factor = RankFactor(spellData, line)
     return {
         scaled = scaled,
         half = scaled * (line.var or 0) / 2,
         sp = sp,
-        bonus = (line.coeff or 0) * sp,
+        factor = factor,
+        bonus = (line.coeff or 0) * sp * factor,
     }
 end
 
@@ -393,7 +408,8 @@ local function AddSpellDamage(rows, spellData, line)
     row.values[#row.values + 1] = Fmt(c.scaled - c.half + c.bonus) .. "-" .. Fmt(c.scaled + c.half + c.bonus)
     row.own[#row.own + 1] = {
         n = Fmt(c.scaled) .. (c.half >= 0.05 and (" ±" .. Fmt(c.half)) or "") .. " base + " .. Fmt(c.bonus)
-            .. " spellpower (" .. Fmt((line.coeff or 0) * 100) .. "% × " .. Fmt(c.sp) .. ")",
+            .. " spellpower (" .. Fmt((line.coeff or 0) * 100) .. "% × " .. Fmt(c.sp)
+            .. (c.factor < 1 and (" × " .. Fmt(c.factor * 100) .. "% for a low rank") or "") .. ")",
     }
 end
 
@@ -1862,6 +1878,78 @@ local function DescriptionListing(spellID)
     return table.concat(out, "\n")
 end
 
+-- /spelltips probe <spell name or ID>: every rank of a spell, side by side: the level it is learned at, what the
+-- addon computes without any downrank adjustment, and the numbers in the game's own description. For working out
+-- how the game treats lower ranks. The first run asks the game to load the descriptions; run it again if any say
+-- "not loaded".
+local function ProbeListing(filter)
+    filter = (filter or ""):match("^%s*(.-)%s*$")
+    if filter == "" then return "Usage: /spelltips probe Healing Touch   (or a spell ID)" end
+    local out = {}
+    local function add(text) out[#out + 1] = text end
+
+    local wantedName, wantedID = filter:lower(), tonumber(filter)
+    if wantedID then
+        local n = C_Spell.GetSpellName(wantedID)
+        if not n then return "No spell with ID " .. wantedID end
+        wantedName = n:lower()
+    end
+    local classSet = PlayerClassSet()
+    local ids = {}
+    for id, sd in pairs(Data.AddonData or {}) do
+        if sd.name and sd.name:lower() == wantedName and sd.lines
+           and (sd.classSet == 0 or sd.classSet == classSet) then
+            ids[#ids + 1] = id
+        end
+    end
+    table.sort(ids, function(a, b)
+        local la, lb = Data.AddonData[a].baseLevel or 0, Data.AddonData[b].baseLevel or 0
+        if la ~= lb then return la < lb end
+        return a < b
+    end)
+    if #ids == 0 then return "No ranks of '" .. filter .. "' for your class in Data.lua." end
+
+    if C_Spell.RequestLoadSpellData then
+        for _, id in ipairs(ids) do pcall(C_Spell.RequestLoadSpellData, id) end
+    end
+
+    local version, build = GetBuildInfo()
+    local _, class = UnitClass("player")
+    add(string.format("probe '%s'  client %s build %s  %s level %d", filter, tostring(version), tostring(build),
+        tostring(class), UnitLevel("player") or 0))
+    local power = {}
+    for school = 1, 7 do power[#power + 1] = school .. "=" .. tostring(ReadLive("damage" .. school, GetSpellBonusDamage, school)) end
+    add("spell power: healing " .. tostring(ReadLive("healing", GetSpellBonusHealing)) .. ", damage by school "
+        .. table.concat(power, " "))
+    add("")
+    for _, id in ipairs(ids) do
+        local sd = Data.AddonData[id]
+        local okRank, rank = pcall(function() return (C_Spell.GetSpellSubtext or GetSpellSubtext)(id) end)
+        add(string.format("spell %d  %s  learned at level %s (max level %s)  known=%s", id,
+            okRank and tostring(rank) or "?", tostring(sd.baseLevel), tostring(sd.maxLevel), tostring(IsSpellKnown and IsSpellKnown(id))))
+        local keys = {}
+        for k in pairs(sd.lines) do keys[#keys + 1] = k end
+        table.sort(keys)
+        for _, k in ipairs(keys) do
+            local line = sd.lines[k]
+            if (line.type == EFFECT.SCHOOL_DAMAGE or line.type == EFFECT.HEAL) and (line.coeff or 0) > 0 then
+                local c = PredictRange(sd, line)
+                add(string.format("  effect %d: base %.3f +/- %.3f, coefficient %.4f, spell power used %s, rank factor %.3f, "
+                    .. "bonus %.3f, predicted range %.3f - %.3f", k, c.scaled, c.half, line.coeff or 0, tostring(c.sp), c.factor,
+                    c.bonus, c.scaled - c.half + c.bonus, c.scaled + c.half + c.bonus))
+            end
+        end
+        local okDesc, desc = pcall(C_Spell.GetSpellDescription, id)
+        if okDesc and type(desc) == "string" and not (issecretvalue and issecretvalue(desc)) and desc ~= "" then
+            desc = desc:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", ""):gsub("[\r\n]+", " ")
+            add("  game: " .. desc:sub(1, 240))
+        else
+            add("  game: (not loaded, run the command again)")
+        end
+    end
+    return table.concat(out, "\n")
+end
+
 local function EnumListing(filter)
     local out = {}
     local function add(text) out[#out + 1] = text end
@@ -1920,6 +2008,8 @@ SlashCmdList["SPELLTIPS"] = function(msg)
             DescriptionListing(tonumber(rest)))
     elseif word == "report" then
         ShowReport()
+    elseif word == "probe" then
+        ShowCopyText("SpellTips: rank probe", "Press Select all, Ctrl+C, and paste it to the developer.", ProbeListing(rest))
     elseif word == "debug" then
         DevDebug()
     elseif word == "verify" then
