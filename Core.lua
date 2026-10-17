@@ -28,6 +28,7 @@ local COLOR = {
     dim        = "666666",
     sel        = "ffd100",  -- the talent selected with Alt+wheel
     selNote    = "c8a840",
+    heal       = "ffd100",  -- text of the heal labels
 }
 
 -- Game ids the rules below key on. Spell effect types and aura types are numbers in the game files with
@@ -2270,11 +2271,20 @@ local heal = { entries = {}, ranks = {}, on = false, dirty = false, sinceRebuild
 -- Settings live in db.heal: spell ("all" = every heal you know, merged into one ladder; or one spell's name),
 -- label ("key" = bound key, else rank; "rank"; "both"), frames ("all", "group" = not your own, "mouse" = only
 -- the frame under the cursor), persist (come back after a reload or login), on.
-local HEAL_DEFAULTS = { spell = "all", label = "key", frames = "all", persist = true, on = false }
+local HEAL_DEFAULTS = { spell = "all", look = "icon", frames = "all", persist = true, on = false,
+    anchor = "RIGHT", x = -3, y = 0, inside = true, size = 24 }
+local HEAL_ANCHORS = { "RIGHT", "LEFT", "TOP", "BOTTOM", "CENTER", "TOPRIGHT", "TOPLEFT", "BOTTOMRIGHT", "BOTTOMLEFT" }
+local HEAL_OPPOSITE = { RIGHT = "LEFT", LEFT = "RIGHT", TOP = "BOTTOM", BOTTOM = "TOP", CENTER = "CENTER",
+    TOPRIGHT = "BOTTOMLEFT", TOPLEFT = "BOTTOMRIGHT", BOTTOMRIGHT = "TOPLEFT", BOTTOMLEFT = "TOPRIGHT" }
 local function HealCfg()
     db.heal = type(db.heal) == "table" and db.heal or {}
     for k, v in pairs(HEAL_DEFAULTS) do if db.heal[k] == nil then db.heal[k] = v end end
-    return db.heal
+    local cfg = db.heal
+    cfg.x, cfg.y = tonumber(cfg.x) or HEAL_DEFAULTS.x, tonumber(cfg.y) or HEAL_DEFAULTS.y
+    cfg.size = math.max(10, math.min(64, tonumber(cfg.size) or HEAL_DEFAULTS.size))
+    if not HEAL_OPPOSITE[cfg.anchor] then cfg.anchor = HEAL_DEFAULTS.anchor end
+    if cfg.look ~= "icon" and cfg.look ~= "both" and cfg.look ~= "key" and cfg.look ~= "rank" then cfg.look = HEAL_DEFAULTS.look end
+    return cfg
 end
 local HEAL_MIN_FRACTION = 0.6  -- no label until missing health reaches this share of the smallest rank's heal
 
@@ -2320,7 +2330,7 @@ local function KeyForSpell(spellID, spellName, rankNumber)
             end
             if match then
                 local key = GetBindingKey(command)
-                if key then return ShortKey(key) end
+                if key then return ShortKey(key), slot, kind end
             end
         end
     end
@@ -2397,13 +2407,17 @@ local function KnownHealRanks()
     end
     for _, r in ipairs(rows) do
         local okName, spellName = pcall(C_Spell.GetSpellName, r.id)
-        r.key = KeyForSpell(r.id, okName and spellName or nil, r.number)
-        local rankText = (multi and Initials(r.name) or "") .. r.number
-        local inner
-        if cfg.label == "rank" then inner = rankText
-        elseif cfg.label == "both" then inner = r.key and (r.key .. " " .. rankText) or rankText
-        else inner = r.key or rankText end
-        r.text = "[" .. inner .. "]"
+        r.key, r.slot, r.slotKind = KeyForSpell(r.id, okName and spellName or nil, r.number)
+        local rankText = (multi and (Initials(r.name) .. " ") or "") .. "r" .. r.number
+        r.rankText = rankText
+        local okIcon, icon = pcall(function() return (C_Spell.GetSpellTexture or GetSpellTexture)(r.id) end)
+        r.icon = okIcon and icon or nil
+        -- main: the big text; small: the corner text (icon look only)
+        if cfg.look == "icon" then r.main, r.small = r.key or "", rankText
+        elseif cfg.look == "both" then r.main = (r.key or "-") .. " " .. rankText
+        elseif cfg.look == "rank" then r.main = rankText
+        else r.main = r.key or rankText end
+        r.text = "[" .. ((cfg.look == "both" or cfg.look == "rank") and r.main or (r.key or rankText)) .. "]"
     end
     return rows
 end
@@ -2454,6 +2468,71 @@ local function BandCurve(pctLow, pctHigh)
     return curve
 end
 
+local function HealFont() return STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF" end
+
+local function HealSetFont(fontString, size)
+    if not pcall(fontString.SetFont, fontString, HealFont(), math.max(8, math.floor(size + 0.5)), "OUTLINE") then
+        pcall(fontString.SetFontObject, fontString, GameFontNormal)
+    end
+end
+
+-- Where a unit frame's holder sits: anchored inside the frame's edge, or just outside it.
+local function HealPlace(entry)
+    local cfg = HealCfg()
+    local holder = entry.holder
+    if not holder then return end
+    holder:ClearAllPoints()
+    holder:SetPoint(cfg.inside and cfg.anchor or HEAL_OPPOSITE[cfg.anchor], entry.frame, cfg.anchor, cfg.x, cfg.y)
+    local size = cfg.size
+    if cfg.look == "icon" then holder:SetSize(size, size) else holder:SetSize(size * 2.6, size * 0.8) end
+end
+
+-- Fonts, colors, text and which parts are shown, for every label of an entry. Safe in combat.
+local function HealStyle(entry, ranks)
+    local cfg = HealCfg()
+    local r, g, b = HexToRGB(COLOR.heal)
+    local horizontal = cfg.anchor:find("LEFT") and "LEFT" or (cfg.anchor:find("RIGHT") and "RIGHT" or "CENTER")
+    for i, label in ipairs(entry.labels) do
+        local rank = ranks[i]
+        label.active = {}
+        label.icon:Hide() label.key:Hide() label.small:Hide()
+        if rank then
+            label.key:ClearAllPoints() label.small:ClearAllPoints()
+            label.key:SetTextColor(r, g, b)
+            label.small:SetTextColor(r, g, b)
+            if cfg.look == "icon" then
+                if rank.icon then label.icon:SetTexture(rank.icon) end
+                label.icon:SetAllPoints(entry.holder)
+                HealSetFont(label.key, cfg.size * 0.55)
+                HealSetFont(label.small, cfg.size * 0.34)
+                label.key:SetPoint("CENTER", entry.holder, "CENTER", 0, 0)
+                label.small:SetPoint("BOTTOMRIGHT", entry.holder, "BOTTOMRIGHT", -1, 1)
+                label.key:SetText(rank.main)
+                label.small:SetText(rank.small or "")
+                label.active = { label.icon, label.key, label.small }
+            else
+                HealSetFont(label.key, cfg.size * 0.6)
+                label.key:SetPoint(horizontal, entry.holder, horizontal, 0, 0)
+                label.key:SetJustifyH(horizontal)
+                label.key:SetText(rank.main)
+                label.active = { label.key }
+            end
+            for _, region in ipairs(label.active) do region:Show() end
+        end
+    end
+end
+
+local function HealRestyle()
+    for _, entry in ipairs(heal.entries) do
+        HealPlace(entry)
+        HealStyle(entry, heal.ranks)
+        if entry.holder then
+            local canMouse = heal.unlock and not InCombatLockdown()
+            pcall(entry.holder.EnableMouse, entry.holder, canMouse and true or false)
+        end
+    end
+end
+
 local function HealRebuild()
     local ranks = KnownHealRanks()
     heal.ranks = ranks
@@ -2468,19 +2547,28 @@ local function HealRebuild()
             if ok and holder then
                 entry.holder = holder
                 pcall(function() holder:SetFrameLevel(found.frame:GetFrameLevel() + 10) end)
+                pcall(function()
+                    holder:RegisterForDrag("LeftButton")
+                    holder:SetScript("OnDragStart", function()
+                        local cx, cy = GetCursorPosition()
+                        local cfg = HealCfg()
+                        heal.drag = { frame = found.frame, cx = cx, cy = cy, x0 = cfg.x, y0 = cfg.y }
+                    end)
+                    holder:SetScript("OnDragStop", function() heal.drag = nil if heal.onMoved then heal.onMoved() end end)
+                end)
             end
         end
         entry.unit = found.unit
         if entry.holder then
             for i = #entry.labels + 1, #ranks do
-                local label = entry.holder:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-                label:SetPoint("RIGHT", entry.frame, "RIGHT", -3, 0)
-                label:SetAlpha(0)
-                entry.labels[i] = label
+                local icon = entry.holder:CreateTexture(nil, "OVERLAY")
+                local key = entry.holder:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+                local small = entry.holder:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                entry.labels[i] = { icon = icon, key = key, small = small, active = {} }
+                icon:SetAlpha(0) key:SetAlpha(0) small:SetAlpha(0)
             end
-            for i, label in ipairs(entry.labels) do
+            for i = 1, #entry.labels do
                 local rank = ranks[i]
-                label:SetText(rank and rank.text or "")
                 entry.curves[i] = nil
                 if rank then
                     -- band in missing health: from (60% of the smallest heal | the previous rank's average) to this rank's average
@@ -2504,30 +2592,45 @@ local function HealRebuild()
     -- frames no longer wanted (setting changed, frame gone): hide what they carry
     for _, entry in pairs(known) do
         if not current[entry] then
-            for _, label in ipairs(entry.labels) do label:SetAlpha(0) end
+            for _, label in ipairs(entry.labels) do
+                for _, region in ipairs(label.active or {}) do region:SetAlpha(0) end
+            end
         end
     end
     heal.entries = entries
+    HealRestyle()
     heal.dirty = false
     heal.sinceRebuild = 0
 end
 
+local function HealSetAlpha(label, alpha)
+    for _, region in ipairs(label.active) do region:SetAlpha(alpha) end
+end
+
 local function HealTick()
+    local cfg = HealCfg()
     for _, entry in ipairs(heal.entries) do
         local okShown, shown = pcall(entry.frame.IsShown, entry.frame)
-        local okDead, dead = pcall(UnitIsDeadOrGhost, entry.unit)
-        local hide = not (okShown and shown) or (okDead and dead == true)
-        if not hide and HealCfg().frames == "mouse" then
-            local okMouse, over = pcall(entry.frame.IsMouseOver, entry.frame)
-            hide = not (okMouse and over == true)
+        local hide = not (okShown and shown)
+        if not heal.unlock then
+            local okDead, dead = pcall(UnitIsDeadOrGhost, entry.unit)
+            if okDead and dead == true then hide = true end
+            if not hide and cfg.frames == "mouse" then
+                local okMouse, over = pcall(entry.frame.IsMouseOver, entry.frame)
+                hide = not (okMouse and over == true)
+            end
         end
         for i, label in ipairs(entry.labels) do
             local curve = entry.curves[i]
-            if hide or not curve then
-                label:SetAlpha(0)
+            if hide then
+                HealSetAlpha(label, 0)
+            elseif heal.unlock then
+                HealSetAlpha(label, i == 1 and 1 or 0)  -- while moving, show one label on every frame
+            elseif not curve then
+                HealSetAlpha(label, 0)
             else
-                local ok = pcall(function() label:SetAlpha(UnitHealthPercent(entry.unit, false, curve)) end)
-                if not ok then label:SetAlpha(0) end
+                local ok = pcall(function() HealSetAlpha(label, UnitHealthPercent(entry.unit, false, curve)) end)
+                if not ok then HealSetAlpha(label, 0) end
             end
         end
     end
@@ -2543,6 +2646,15 @@ local function HealDriver()
     d:SetScript("OnEvent", function() heal.dirty = true end)
     d:SetScript("OnUpdate", function(_, dt)
         if not heal.on then return end
+        if heal.drag then
+            local cx, cy = GetCursorPosition()
+            local okScale, scale = pcall(heal.drag.frame.GetEffectiveScale, heal.drag.frame)
+            scale = (okScale and type(scale) == "number" and scale > 0) and scale or 1
+            local cfg = HealCfg()
+            cfg.x = math.floor(heal.drag.x0 + (cx - heal.drag.cx) / scale + 0.5)
+            cfg.y = math.floor(heal.drag.y0 + (cy - heal.drag.cy) / scale + 0.5)
+            HealRestyle()
+        end
         heal.sinceTick = heal.sinceTick + dt
         heal.sinceRebuild = heal.sinceRebuild + dt
         if heal.sinceTick >= 0.1 then
@@ -2565,9 +2677,10 @@ end
 local HEAL_HELP = "heal commands:\n"
     .. "  /spelltips heal  (turn on)    /spelltips heal off    /spelltips heal status\n"
     .. "  /spelltips heal spell all, or a spell name, e.g. Healing Touch\n"
-    .. "  /spelltips heal label key, rank or both\n"
+    .. "  /spelltips heal look icon, key, rank or both\n"
     .. "  /spelltips heal frames all, group or mouse\n"
-    .. "  /spelltips heal persist on or off"
+    .. "  /spelltips heal persist on or off\n"
+    .. "  Position, size and color are in the settings window under Heal labels..."
 
 local function HealStart()
     if not (C_CurveUtil and C_CurveUtil.CreateCurve and UnitHealthPercent) then
@@ -2585,7 +2698,7 @@ end
 local function HealSummary()
     local cfg = HealCfg()
     local lines = { "heal labels are " .. (heal.on and "ON" or "OFF") .. " on " .. #heal.entries .. " frames",
-        "  spells: " .. (cfg.spell == "all" and "all my heals" or cfg.spell) .. "   label: " .. cfg.label
+        "  spells: " .. (cfg.spell == "all" and "all my heals" or cfg.spell) .. "   look: " .. cfg.look
             .. "   frames: " .. cfg.frames .. "   comes back after reload: " .. (cfg.persist and "yes" or "no") }
     if #heal.ranks == 0 then
         lines[#lines + 1] = "  no known heals found. To test on a non-healer: /spelltips heal spell Frostbolt"
@@ -2594,8 +2707,9 @@ local function HealSummary()
         local low = HEAL_MIN_FRACTION * heal.ranks[1].avg
         for i, rank in ipairs(heal.ranks) do
             local high = heal.ranks[i + 1] and heal.ranks[i].avg or nil
-            lines[#lines + 1] = string.format("    %s   %s", rank.text,
-                high and (Fmt(low) .. " to " .. Fmt(high)) or (Fmt(low) .. " and up"))
+            lines[#lines + 1] = string.format("    %s   %s   (%s rank %s, spell %s%s)", rank.text,
+                high and (Fmt(low) .. " to " .. Fmt(high)) or (Fmt(low) .. " and up"), rank.name or "?", rank.number, rank.id,
+                rank.slot and (", key from bar slot " .. rank.slot .. " " .. tostring(rank.slotKind)) or ", no key found")
             low = high or low
         end
     end
@@ -2624,10 +2738,10 @@ local function HealCommand(arg)
     elseif word == "spell" then
         if value == "" then print("[spelltips] " .. HEAL_HELP) return end
         cfg.spell = value:lower() == "all" and "all" or value
-    elseif word == "label" then
+    elseif word == "look" or word == "label" then
         value = value:lower()
-        if value ~= "key" and value ~= "rank" and value ~= "both" then print("[spelltips] " .. HEAL_HELP) return end
-        cfg.label = value
+        if value ~= "icon" and value ~= "key" and value ~= "rank" and value ~= "both" then print("[spelltips] " .. HEAL_HELP) return end
+        cfg.look = value
     elseif word == "frames" then
         value = value:lower()
         if value == "mouseover" then value = "mouse" end
@@ -2664,9 +2778,12 @@ end
 
 -- The heal label settings, in plain words: a second window opened from the settings window's "Heal labels..." button.
 local healWindow
+local ANCHOR_NAMES = { RIGHT = "Right edge", LEFT = "Left edge", TOP = "Top edge", BOTTOM = "Bottom edge", CENTER = "Center",
+    TOPRIGHT = "Top right corner", TOPLEFT = "Top left corner", BOTTOMRIGHT = "Bottom right corner", BOTTOMLEFT = "Bottom left corner" }
+
 function S.ShowHealSettings()
     if not healWindow then
-        local w = NewPanel("SpellTipsHealSettings", 480, 330, "Heal labels")
+        local w = NewPanel("SpellTipsHealSettings", 480, 500, "Heal labels")
         healWindow = w
         w:ClearAllPoints()
         w:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
@@ -2676,9 +2793,16 @@ function S.ShowHealSettings()
         local function apply()
             if heal.on then
                 heal.dirty = true
-                if not InCombatLockdown() then pcall(HealRebuild) end
+                if not InCombatLockdown() then pcall(HealRebuild) else pcall(HealRestyle) end
             end
         end
+        local function changed() apply() refreshAll() end
+        local function lock()
+            heal.unlock, heal.drag = false, nil
+            pcall(HealRestyle)
+            refreshAll()
+        end
+        w:SetScript("OnHide", lock)
 
         local intro = w:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
         intro:SetPoint("TOPLEFT", 24, -48)
@@ -2691,7 +2815,7 @@ function S.ShowHealSettings()
             function() return { { true, "On" }, { false, "Off" } } end,
             function() return heal.on == true end,
             function(v) if v then HealStart() else HealCommand("off") end end,
-            function() apply() refreshAll() end)
+            changed)
 
         refreshers[#refreshers + 1] = CycleRow(w, -134, "Heals to cover",
             function()
@@ -2704,25 +2828,102 @@ function S.ShowHealSettings()
                 if cfg.spell ~= "all" and not found then list[#list + 1] = { cfg.spell, cfg.spell .. " only" } end
                 return list
             end,
-            function() return cfg.spell end, function(v) cfg.spell = v end, function() apply() refreshAll() end)
+            function() return cfg.spell end, function(v) cfg.spell = v end, changed)
 
-        refreshers[#refreshers + 1] = CycleRow(w, -168, "Label says",
-            function() return { { "key", "The key I press (else rank)" }, { "rank", "The rank number" }, { "both", "Key and rank" } } end,
-            function() return cfg.label end, function(v) cfg.label = v end, function() apply() refreshAll() end)
+        refreshers[#refreshers + 1] = CycleRow(w, -168, "Label looks like",
+            function() return { { "icon", "Spell icon, key on it" }, { "both", "Text: key and rank" },
+                { "key", "Text: key, else rank" }, { "rank", "Text: rank only" } } end,
+            function() return cfg.look end, function(v) cfg.look = v end, changed)
 
         refreshers[#refreshers + 1] = CycleRow(w, -202, "Show on",
             function() return { { "all", "Every frame, mine too" }, { "group", "Party and raid only" }, { "mouse", "Frame under my mouse" } } end,
-            function() return cfg.frames end, function(v) cfg.frames = v end, function() apply() refreshAll() end)
+            function() return cfg.frames end, function(v) cfg.frames = v end, changed)
 
-        refreshers[#refreshers + 1] = CycleRow(w, -236, "After a reload or login",
+        refreshers[#refreshers + 1] = CycleRow(w, -236, "Attached to the frame's",
+            function()
+                local list = {}
+                for _, anchor in ipairs(HEAL_ANCHORS) do list[#list + 1] = { anchor, ANCHOR_NAMES[anchor] } end
+                return list
+            end,
+            function() return cfg.anchor end, function(v) cfg.anchor = v end, changed)
+
+        refreshers[#refreshers + 1] = CycleRow(w, -270, "Sits",
+            function() return { { true, "Inside the frame" }, { false, "Outside the frame" } } end,
+            function() return cfg.inside end, function(v) cfg.inside = v end, changed)
+
+        refreshers[#refreshers + 1] = CycleRow(w, -304, "Size",
+            function()
+                local list, found = {}, false
+                for _, size in ipairs({ 14, 18, 22, 24, 28, 32, 40, 48 }) do
+                    list[#list + 1] = { size, size .. " pixels" }
+                    if size == cfg.size then found = true end
+                end
+                if not found then list[#list + 1] = { cfg.size, cfg.size .. " pixels" } end
+                return list
+            end,
+            function() return cfg.size end, function(v) cfg.size = v end, changed)
+
+        refreshers[#refreshers + 1] = CycleRow(w, -338, "After a reload or login",
             function() return { { true, "Turn back on by itself" }, { false, "Stay off until I turn on" } } end,
             function() return cfg.persist end, function(v) cfg.persist = v end, function() refreshAll() end)
 
+        -- text color
+        local swatch = NewButton(w, "", 22, nil)
+        swatch:SetSize(22, 22)
+        swatch:SetPoint("TOPLEFT", 24, -376)
+        swatch.texture = swatch:CreateTexture(nil, "OVERLAY")
+        swatch.texture:SetPoint("TOPLEFT", 4, -4)
+        swatch.texture:SetPoint("BOTTOMRIGHT", -4, 4)
+        local function paint()
+            swatch.texture:SetColorTexture(HexToRGB(COLOR.heal))
+            if heal.on then pcall(HealRestyle) end
+        end
+        paint()
+        refreshers[#refreshers + 1] = paint
+        swatch:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        swatch:SetScript("OnClick", function(_, mouse)
+            if mouse == "RightButton" then
+                db.colors.heal = nil
+                ApplyColors()
+                paint()
+            else
+                PickColor("heal", paint)
+            end
+        end)
+        local swatchText = w:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        swatchText:SetPoint("LEFT", swatch, "RIGHT", 8, 0)
+        swatchText:SetText("Text color   (right-click to reset)")
+
+        -- moving
+        local offset = w:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        offset:SetPoint("TOPLEFT", 24, -418)
+        local moveButton
+        moveButton = NewButton(w, "Move labels", 120, function()
+            if heal.unlock then lock() return end
+            if InCombatLockdown() then print("[spelltips] labels cannot be moved during combat") return end
+            if not heal.on then HealStart() end
+            pcall(HealRebuild)
+            heal.unlock = true
+            pcall(HealRestyle)
+            refreshAll()
+        end)
+        moveButton:SetPoint("TOPLEFT", 24, -440)
+        NewButton(w, "Reset position", 120, function()
+            cfg.anchor, cfg.x, cfg.y, cfg.inside = HEAL_DEFAULTS.anchor, HEAL_DEFAULTS.x, HEAL_DEFAULTS.y, HEAL_DEFAULTS.inside
+            changed()
+        end):SetPoint("LEFT", moveButton, "RIGHT", 10, 0)
+        refreshers[#refreshers + 1] = function()
+            moveButton:SetText(heal.unlock and "Lock labels" or "Move labels")
+            offset:SetText(heal.unlock and "Drag a label with the left mouse button. Every frame follows it. Offset: " .. cfg.x .. ", " .. cfg.y
+                or "Offset from the attach point: " .. cfg.x .. ", " .. cfg.y .. "  (Move labels lets you drag it)")
+        end
+        heal.onMoved = refreshAll
+
         local note = w:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-        note:SetPoint("BOTTOMLEFT", 24, 22)
+        note:SetPoint("BOTTOMLEFT", 24, 18)
         note:SetWidth(432)
         note:SetJustifyH("LEFT")
-        note:SetText("The key comes from your action bars (a spell button, or a macro that names the rank). "
+        note:SetText("The key comes from your action bars (a spell button, or a macro naming the rank). "
             .. "To try this on a non-healer, type /spelltips heal spell Frostbolt.")
         w.refreshAll = refreshAll
     end
