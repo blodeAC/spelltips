@@ -1878,20 +1878,13 @@ local function DescriptionListing(spellID)
     return table.concat(out, "\n")
 end
 
--- /spelltips probe <spell name or ID>: every rank of a spell, side by side: the level it is learned at, what the
--- addon computes without any downrank adjustment, and the numbers in the game's own description. For working out
--- how the game treats lower ranks. The first run asks the game to load the descriptions; run it again if any say
--- "not loaded".
-local function ProbeListing(filter)
-    filter = (filter or ""):match("^%s*(.-)%s*$")
-    if filter == "" then return "Usage: /spelltips probe Healing Touch   (or a spell ID)" end
-    local out = {}
-    local function add(text) out[#out + 1] = text end
-
+-- Every Data.lua entry with this spell's name that belongs to the player's class, lowest rank first.
+-- Takes a name or a spell ID. Returns the IDs (possibly empty), or nil and a message.
+local function RanksOfSpell(filter)
     local wantedName, wantedID = filter:lower(), tonumber(filter)
     if wantedID then
         local n = C_Spell.GetSpellName(wantedID)
-        if not n then return "No spell with ID " .. wantedID end
+        if not n then return nil, "No spell with ID " .. wantedID end
         wantedName = n:lower()
     end
     local classSet = PlayerClassSet()
@@ -1907,6 +1900,21 @@ local function ProbeListing(filter)
         if la ~= lb then return la < lb end
         return a < b
     end)
+    return ids
+end
+
+-- /spelltips probe <spell name or ID>: every rank of a spell, side by side: the level it is learned at, what the
+-- addon computes without any downrank adjustment, and the numbers in the game's own description. For working out
+-- how the game treats lower ranks. The first run asks the game to load the descriptions; run it again if any say
+-- "not loaded".
+local function ProbeListing(filter)
+    filter = (filter or ""):match("^%s*(.-)%s*$")
+    if filter == "" then return "Usage: /spelltips probe Healing Touch   (or a spell ID)" end
+    local out = {}
+    local function add(text) out[#out + 1] = text end
+
+    local ids, message = RanksOfSpell(filter)
+    if not ids then return message end
     if #ids == 0 then return "No ranks of '" .. filter .. "' for your class in Data.lua." end
 
     if C_Spell.RequestLoadSpellData then
@@ -1947,6 +1955,123 @@ local function ProbeListing(filter)
             add("  game: (not loaded, run the command again)")
         end
     end
+    return table.concat(out, "\n")
+end
+
+-- /spelltips pick <missing HP> <spell name>: which known rank of a spell covers that much missing health with
+-- the least waste, using the predicted heal of each rank (spell power and the downrank penalty included).
+-- The missing-HP number is typed in, so this works on a dummy and out of combat.
+local function PickListing(arg)
+    local missingText, name = (arg or ""):match("^%s*(%d+)%s+(.-)%s*$")
+    local missing = tonumber(missingText)
+    if not missing or name == "" then return "Usage: /spelltips pick 375 Healing Touch" end
+    local ids, message = RanksOfSpell(name)
+    if not ids then return message end
+
+    local function plain(v) return type(v) == "number" and not (issecretvalue and issecretvalue(v)) and v or nil end
+    local rows = {}
+    for _, id in ipairs(ids) do
+        local sd = Data.AddonData[id]
+        local okKnown, known = pcall(function() return IsSpellKnown == nil or IsSpellKnown(id) end)
+        local line
+        for _, k in ipairs(SortedKeys(sd.lines)) do
+            local l = sd.lines[k]
+            if l.type == EFFECT.HEAL and (l.coeff or 0) > 0 then line = l break end
+        end
+        if line and okKnown and known then
+            local c = PredictRange(sd, line)
+            local okRank, rank = pcall(function() return (C_Spell.GetSpellSubtext or GetSpellSubtext)(id) end)
+            local okCost, cost = pcall(function() return (C_Spell.GetSpellPowerCost(id) or {})[1] end)
+            local okInfo, info = pcall(C_Spell.GetSpellInfo, id)
+            rows[#rows + 1] = {
+                id = id, rank = okRank and tostring(rank) or "?", factor = c.factor,
+                lo = c.scaled - c.half + c.bonus, hi = c.scaled + c.half + c.bonus,
+                avg = c.scaled + c.bonus,
+                cost = okCost and cost and plain(cost.cost), cast = okInfo and info and plain(info.castTime),
+            }
+        end
+    end
+    if #rows == 0 then return "No known healing ranks of '" .. name .. "' found." end
+
+    local pick
+    for _, r in ipairs(rows) do
+        if r.avg >= missing then pick = r break end
+    end
+    pick = pick or rows[#rows]
+
+    local out = { string.format("missing %d HP, %s, level %d, healing power %s", missing, name, UnitLevel("player") or 0,
+        tostring(ReadLive("healing", GetSpellBonusHealing))) }
+    for _, r in ipairs(rows) do
+        out[#out + 1] = string.format("%s %-8s %6.0f - %-6.0f avg %6.0f  penalty x%.2f  cost %s  cast %s sec  %s%s",
+            r == pick and "->" or "  ", r.rank, r.lo, r.hi, r.avg, r.factor, tostring(r.cost or "?"),
+            r.cast and string.format("%.1f", r.cast / 1000) or "?",
+            r.avg >= missing and string.format("overheal %.0f", r.avg - missing) or string.format("short by %.0f", missing - r.avg),
+            r == pick and (pick.avg >= missing and "   <- lowest rank that covers it" or "   <- nothing covers it, strongest") or "")
+    end
+    return table.concat(out, "\n")
+end
+
+-- /spelltips secrets: what an addon can read about health right now. In combat the client may hand back
+-- "secret" numbers that cannot be compared. Run it mid-fight to capture, then /spelltips secrets show.
+local function SecretKind(v)
+    if v == nil then return "nil" end
+    if issecretvalue and issecretvalue(v) then return "SECRET" end
+    return "readable " .. tostring(v)
+end
+
+local function TryRead(fn, ...)
+    if not fn then return "(no such function)" end
+    local ok, v = pcall(fn, ...)
+    if not ok then return "error" end
+    return SecretKind(v)
+end
+
+local function SecretsSnapshot()
+    local out = {}
+    local function add(text) out[#out + 1] = text end
+    local version, build = GetBuildInfo()
+    add(string.format("health readability  client %s build %s  in combat: %s  issecretvalue exists: %s",
+        tostring(version), tostring(build), tostring(InCombatLockdown()), tostring(issecretvalue ~= nil)))
+
+    local secretFns = {}
+    if C_Secrets then
+        for k, v in pairs(C_Secrets) do
+            if type(v) == "function" then secretFns[#secretFns + 1] = k end
+        end
+        table.sort(secretFns)
+        add("C_Secrets functions: " .. table.concat(secretFns, ", "))
+    else
+        add("C_Secrets: not present")
+    end
+    add("own stats: healing power " .. TryRead(GetSpellBonusHealing) .. ", level " .. TryRead(UnitLevel, "player"))
+    add("")
+
+    local units = { "player", "target", "targettarget", "mouseover", "focus", "party1", "party2", "party3", "party4", "raid1", "raid2" }
+    if C_NamePlate and C_NamePlate.GetNamePlates then
+        local ok, plates = pcall(C_NamePlate.GetNamePlates)
+        for i = 1, ok and type(plates) == "table" and math.min(#plates, 4) or 0 do
+            local token = plates[i].namePlateUnitToken
+            if token then units[#units + 1] = token end
+        end
+    end
+    local shown = 0
+    for _, unit in ipairs(units) do
+        local okExists, exists = pcall(UnitExists, unit)
+        if okExists and exists and not (issecretvalue and issecretvalue(exists)) then
+            shown = shown + 1
+            add(unit .. ":")
+            add("  UnitHealth " .. TryRead(UnitHealth, unit) .. " | UnitHealthMax " .. TryRead(UnitHealthMax, unit)
+                .. " | UnitHealthMissing " .. TryRead(UnitHealthMissing, unit)
+                .. " | UnitHealthPercent " .. TryRead(UnitHealthPercent, unit)
+                .. " | incoming heals " .. TryRead(UnitGetIncomingHeals, unit))
+            add("  friend " .. TryRead(UnitIsFriend, "player", unit) .. " | name " .. TryRead(UnitName, unit)
+                .. " | level " .. TryRead(UnitLevel, unit))
+            for _, fnName in ipairs(secretFns) do
+                if fnName:find("Health") then add("  C_Secrets." .. fnName .. " " .. TryRead(C_Secrets[fnName], unit)) end
+            end
+        end
+    end
+    if shown == 0 then add("no units to read: target something and run it again") end
     return table.concat(out, "\n")
 end
 
@@ -2010,6 +2135,20 @@ SlashCmdList["SPELLTIPS"] = function(msg)
         ShowReport()
     elseif word == "probe" then
         ShowCopyText("SpellTips: rank probe", "Press Select all, Ctrl+C, and paste it to the developer.", ProbeListing(rest))
+    elseif word == "pick" then
+        ShowCopyText("SpellTips: rank pick", "Press Select all, Ctrl+C, and paste it to the developer.", PickListing(rest))
+    elseif word == "secrets" then
+        if rest:lower() == "show" then
+            ShowCopyText("SpellTips: health readability", "Press Select all, Ctrl+C, and paste it to the developer.",
+                S.lastSecrets or "Nothing captured yet. Run /spelltips secrets first.")
+        else
+            S.lastSecrets = SecretsSnapshot()
+            if InCombatLockdown() then
+                print("[spelltips] captured in combat. After the fight, run: /spelltips secrets show")
+            else
+                ShowCopyText("SpellTips: health readability", "Press Select all, Ctrl+C, and paste it to the developer.", S.lastSecrets)
+            end
+        end
     elseif word == "debug" then
         DevDebug()
     elseif word == "verify" then
