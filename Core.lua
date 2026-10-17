@@ -2259,6 +2259,194 @@ local function DemoToggle()
     end)
 end
 
+-- /spelltips heal <spell>: a rank label on every party and raid frame. For each known rank of the spell it works
+-- out the average heal (spell power and downrank penalty included) and draws a label with that rank's number;
+-- the label shows only while the unit's missing health falls where that rank is the best fit (the lowest rank
+-- that covers it, the strongest rank if none does). Current health is secret, so the client decides which label
+-- is visible: each label's alpha is the result of UnitHealthPercent run through a step curve built from the
+-- rank's band. Nothing here reads, compares or does arithmetic on health. /spelltips heal off removes them.
+local heal = { entries = {}, ranks = {}, spell = nil, on = false, dirty = false, sinceRebuild = 99, sinceTick = 0 }
+local HEAL_MIN_FRACTION = 0.6  -- no label until missing health reaches this share of the smallest rank's heal
+
+local function KnownHealRanks(name)
+    local ids = RanksOfSpell(name)
+    local rows = {}
+    for _, id in ipairs(ids or {}) do
+        local sd = Data.AddonData[id]
+        local okKnown, known = pcall(function() return IsSpellKnown == nil or IsSpellKnown(id) end)
+        local line
+        for _, k in ipairs(SortedKeys(sd.lines)) do
+            local l = sd.lines[k]
+            if l.type == EFFECT.HEAL and (l.coeff or 0) > 0 then line = l break end
+        end
+        if line and okKnown and known then
+            local c = PredictRange(sd, line)
+            local okRank, rankText = pcall(function() return (C_Spell.GetSpellSubtext or GetSpellSubtext)(id) end)
+            rows[#rows + 1] = { id = id, avg = c.scaled + c.bonus, number = tonumber(okRank and tostring(rankText):match("(%d+)") or nil) }
+        end
+    end
+    table.sort(rows, function(a, b) return a.avg < b.avg end)
+    for i, r in ipairs(rows) do r.number = r.number or i end
+    return rows
+end
+
+local function HealUnitOf(frame)
+    local okAttr, unit = pcall(frame.GetAttribute, frame, "unit")
+    if not (okAttr and type(unit) == "string") then unit = frame.unit end
+    if type(unit) == "string" and (unit == "player" or unit:match("^party%d$") or unit:match("^raid%d+$")) then return unit end
+end
+
+local function ScanUnitFrames()
+    local found, seen = {}, {}
+    if not EnumerateFrames then return found end
+    local frame = EnumerateFrames()
+    while frame do
+        if not seen[frame] and frame.GetAttribute then
+            seen[frame] = true
+            local unit = HealUnitOf(frame)
+            if unit then found[#found + 1] = { frame = frame, unit = unit } end
+        end
+        frame = EnumerateFrames(frame)
+    end
+    return found
+end
+
+-- one step curve per rank: 1 inside the rank's band of health percent (0..1), 0 outside it
+local function BandCurve(pctLow, pctHigh)
+    local curve = C_CurveUtil.CreateCurve()
+    curve:SetType(Enum.LuaCurveType.Step)
+    curve:AddPoint(0, pctLow <= 0 and 1 or 0)
+    if pctLow > 0 then curve:AddPoint(pctLow, 1) end
+    curve:AddPoint(pctHigh, 0)
+    return curve
+end
+
+local function HealRebuild()
+    local ranks = KnownHealRanks(heal.spell)
+    heal.ranks = ranks
+    local known = {}
+    for _, entry in ipairs(heal.entries) do known[entry.frame] = entry end
+    local entries = {}
+    for _, found in ipairs(ScanUnitFrames()) do
+        local entry = known[found.frame]
+        if not entry then
+            entry = { frame = found.frame, labels = {}, curves = {} }
+            local ok, holder = pcall(CreateFrame, "Frame", nil, found.frame)
+            if ok and holder then
+                entry.holder = holder
+                pcall(function() holder:SetFrameLevel(found.frame:GetFrameLevel() + 10) end)
+            end
+        end
+        entry.unit = found.unit
+        if entry.holder then
+            for i = #entry.labels + 1, #ranks do
+                local label = entry.holder:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+                label:SetPoint("RIGHT", entry.frame, "RIGHT", -3, 0)
+                label:SetAlpha(0)
+                entry.labels[i] = label
+            end
+            for i, label in ipairs(entry.labels) do
+                local rank = ranks[i]
+                label:SetText(rank and ("[" .. rank.number .. "]") or "")
+                entry.curves[i] = nil
+                if rank then
+                    -- band in missing health: from (60% of the smallest heal | the previous rank's average) to this rank's average
+                    local okMax, max = pcall(UnitHealthMax, entry.unit)
+                    if okMax and type(max) == "number" and not (issecretvalue and issecretvalue(max)) and max > 0 then
+                        local lowMissing = (i == 1) and HEAL_MIN_FRACTION * rank.avg or ranks[i - 1].avg
+                        local highMissing = (i == #ranks) and max or rank.avg
+                        local pctLow, pctHigh = math.max(0, 1 - highMissing / max), 1 - lowMissing / max
+                        if pctHigh > pctLow and pctHigh > 0 then
+                            local okCurve, curve = pcall(BandCurve, pctLow, math.min(pctHigh, 1.0001))
+                            entry.curves[i] = okCurve and curve or nil
+                        end
+                    end
+                end
+            end
+        end
+        entries[#entries + 1] = entry
+    end
+    heal.entries = entries
+    heal.dirty = false
+    heal.sinceRebuild = 0
+end
+
+local function HealTick()
+    for _, entry in ipairs(heal.entries) do
+        local okShown, shown = pcall(entry.frame.IsShown, entry.frame)
+        local okDead, dead = pcall(UnitIsDeadOrGhost, entry.unit)
+        local hide = not (okShown and shown) or (okDead and dead == true)
+        for i, label in ipairs(entry.labels) do
+            local curve = entry.curves[i]
+            if hide or not curve then
+                label:SetAlpha(0)
+            else
+                local ok = pcall(function() label:SetAlpha(UnitHealthPercent(entry.unit, false, curve)) end)
+                if not ok then label:SetAlpha(0) end
+            end
+        end
+    end
+end
+
+local function HealDriver()
+    if heal.driver then return heal.driver end
+    local d = CreateFrame("Frame")
+    for _, event in ipairs({ "GROUP_ROSTER_UPDATE", "PLAYER_REGEN_ENABLED", "UNIT_MAXHEALTH", "SPELLS_CHANGED", "PLAYER_ENTERING_WORLD" }) do
+        pcall(d.RegisterEvent, d, event)
+    end
+    d:SetScript("OnEvent", function() heal.dirty = true end)
+    d:SetScript("OnUpdate", function(_, dt)
+        if not heal.on then return end
+        heal.sinceTick = heal.sinceTick + dt
+        heal.sinceRebuild = heal.sinceRebuild + dt
+        if heal.sinceTick >= 0.1 then
+            heal.sinceTick = 0
+            local ok, err = pcall(HealTick)
+            if not ok and not heal.errorShown then heal.errorShown = true print("[spelltips] heal: " .. tostring(err)) end
+        end
+        if not InCombatLockdown() and (heal.dirty or heal.sinceRebuild >= 3) then
+            local ok, err = pcall(HealRebuild)
+            if not ok then
+                heal.sinceRebuild = 0
+                if not heal.errorShown then heal.errorShown = true print("[spelltips] heal: " .. tostring(err)) end
+            end
+        end
+    end)
+    heal.driver = d
+    return d
+end
+
+local function HealCommand(arg)
+    arg = (arg or ""):match("^%s*(.-)%s*$")
+    if arg:lower() == "off" then
+        heal.on = false
+        for _, entry in ipairs(heal.entries) do
+            for _, label in ipairs(entry.labels) do label:SetAlpha(0) end
+        end
+        print("[spelltips] heal labels off")
+        return
+    end
+    if arg ~= "" then heal.spell = arg end
+    if not heal.spell then print("[spelltips] usage: /spelltips heal Healing Touch   (then /spelltips heal off)") return end
+    if not (C_CurveUtil and C_CurveUtil.CreateCurve and UnitHealthPercent) then
+        print("[spelltips] this client has no curve helpers, so heal labels cannot work here")
+        return
+    end
+    HealDriver()
+    heal.on = true
+    heal.errorShown = false
+    if InCombatLockdown() then
+        print("[spelltips] heal labels on for " .. heal.spell .. "; they will be drawn when combat ends")
+        heal.dirty = true
+        return
+    end
+    HealRebuild()
+    local parts = {}
+    for _, rank in ipairs(heal.ranks) do parts[#parts + 1] = "[" .. rank.number .. "] ~" .. Fmt(rank.avg) end
+    print(string.format("[spelltips] heal labels on for %s: %d frames, %d ranks (%s)", heal.spell, #heal.entries,
+        #heal.ranks, #parts > 0 and table.concat(parts, "  ") or "no known ranks found"))
+end
+
 local function EnumListing(filter)
     local out = {}
     local function add(text) out[#out + 1] = text end
@@ -2333,6 +2521,8 @@ SlashCmdList["SPELLTIPS"] = function(msg)
                 ShowCopyText("SpellTips: health readability", "Press Select all, Ctrl+C, and paste it to the developer.", S.lastSecrets)
             end
         end
+    elseif word == "heal" then
+        HealCommand(rest)
     elseif word == "demo" then
         DemoToggle()
     elseif word == "curve" then

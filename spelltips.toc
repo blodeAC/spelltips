@@ -1,5 +1,5 @@
 ## Interface: 16001
-## Version: 0.0.11
+## Version: 0.0.12
 ## Title: spell tooltips
 ## Notes: Shows spell power coefficients when holding the Alt key.
 ## SavedVariables: SpellTipsDB
