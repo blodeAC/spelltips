@@ -2294,6 +2294,19 @@ local function KnownHealRanks(name)
     return rows
 end
 
+-- Only a real unit frame gets a label: a Button (not a status bar or a texture) at least this big. Buff and
+-- debuff icons, cast bars and the bars inside a frame also carry a unit, and must be skipped.
+local HEAL_FRAME_MIN_WIDTH, HEAL_FRAME_MIN_HEIGHT = 60, 25
+
+local function LooksLikeUnitFrame(frame)
+    local okType, isButton = pcall(frame.IsObjectType, frame, "Button")
+    if not (okType and isButton) then return false end
+    local okSize, width, height = pcall(frame.GetSize, frame)
+    if not okSize or type(width) ~= "number" or type(height) ~= "number" then return false end
+    if issecretvalue and (issecretvalue(width) or issecretvalue(height)) then return false end
+    return width >= HEAL_FRAME_MIN_WIDTH and height >= HEAL_FRAME_MIN_HEIGHT
+end
+
 local function HealUnitOf(frame)
     local okAttr, unit = pcall(frame.GetAttribute, frame, "unit")
     if not (okAttr and type(unit) == "string") then unit = frame.unit end
@@ -2308,7 +2321,7 @@ local function ScanUnitFrames()
         if not seen[frame] and frame.GetAttribute then
             seen[frame] = true
             local unit = HealUnitOf(frame)
-            if unit then found[#found + 1] = { frame = frame, unit = unit } end
+            if unit and LooksLikeUnitFrame(frame) then found[#found + 1] = { frame = frame, unit = unit } end
         end
         frame = EnumerateFrames(frame)
     end
