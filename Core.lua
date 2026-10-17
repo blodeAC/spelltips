@@ -2809,6 +2809,23 @@ local function HealSummary()
             low = high or low
         end
     end
+    lines[#lines + 1] = "  frames found (" .. #heal.entries .. "):"
+    for _, entry in ipairs(heal.entries) do
+        local frame = entry.frame
+        local okName, name = pcall(frame.GetName, frame)
+        local parent
+        if not (okName and name) then
+            local okParent, p = pcall(frame.GetParent, frame)
+            if okParent and p then
+                local okPName, pName = pcall(p.GetName, p)
+                parent = okPName and pName or nil
+            end
+        end
+        local okShown, shown = pcall(frame.IsShown, frame)
+        lines[#lines + 1] = string.format("    %-8s %-34s %s, health bar %s", tostring(entry.unit),
+            (okName and name) or (parent and ("(in " .. parent .. ")")) or "(unnamed)",
+            (okShown and shown) and "visible" or "hidden", entry.bar and "found" or "not found")
+    end
     return table.concat(lines, "\n")
 end
 
