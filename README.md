@@ -56,6 +56,16 @@ Settings are saved in `SpellTipsDB`.
 | `/spelltips enum [name]` | list the client's `Enum` tables (developer tool) |
 | `/spelltips desc [spellID]` | where a spell's description text is (developer tool) |
 | `/spelltips debug` | toggle debug output in chat (developer tool) |
+| `/spelltips probe <spell>` | every rank of a spell: learn level, predicted numbers and the game's own text (developer tool) |
+| `/spelltips pick <missing HP> <spell>` | the lowest known healing rank that covers that much missing health (developer tool) |
+| `/spelltips secrets` | whether the client lets addons read health numbers right now; run it in combat, then `/spelltips secrets show` (developer tool) |
+| `/spelltips curve` | whether a secret health number can still drive a display (curve helpers, widgets); run it like `secrets` (developer tool) |
+| `/spelltips demo` | show or hide a small window testing whether secret health can drive a display (developer tool) |
+| `/spelltips heal` | experimental: a label on each unit frame showing which heal fits the missing health (the key it's bound to, else its rank); `heal off` removes it, `heal status` shows the settings |
+| `/spelltips heal spell <name or all>` | which heals the labels cover: `all` (default) merges every heal you know into one ladder, or name a single spell |
+| `/spelltips heal label <key, rank or both>` | what the label says: bound key else rank (default), rank only, or both |
+| `/spelltips heal frames <all, group or mouse>` | which frames: everyone including you (default), party and raid only, or just the frame under the cursor |
+| `/spelltips heal persist <on or off>` | whether the labels come back after a reload or login (default on) |
 | `/spelltips verify [name]` | check every talent's numbers against the game's own text (developer tool) |
 | `/spelltips ranks <name>` | a talent's text at each rank and the data rows behind it (developer tool) |
 | `/spelltips talent <name or id>` | open the talent window on a talent (developer tool) |
@@ -91,7 +101,3 @@ The data file defines one global table, `SpellTipsData`, and records the game bu
 ## License
 
 none
-
-
-
-
