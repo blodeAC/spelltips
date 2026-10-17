@@ -2704,19 +2704,19 @@ function S.ShowHealSettings()
                 if cfg.spell ~= "all" and not found then list[#list + 1] = { cfg.spell, cfg.spell .. " only" } end
                 return list
             end,
-            function() return cfg.spell end, function(v) cfg.spell = v end, apply)
+            function() return cfg.spell end, function(v) cfg.spell = v end, function() apply() refreshAll() end)
 
         refreshers[#refreshers + 1] = CycleRow(w, -168, "Label says",
             function() return { { "key", "The key I press (else rank)" }, { "rank", "The rank number" }, { "both", "Key and rank" } } end,
-            function() return cfg.label end, function(v) cfg.label = v end, apply)
+            function() return cfg.label end, function(v) cfg.label = v end, function() apply() refreshAll() end)
 
         refreshers[#refreshers + 1] = CycleRow(w, -202, "Show on",
             function() return { { "all", "Every frame, mine too" }, { "group", "Party and raid only" }, { "mouse", "Frame under my mouse" } } end,
-            function() return cfg.frames end, function(v) cfg.frames = v end, apply)
+            function() return cfg.frames end, function(v) cfg.frames = v end, function() apply() refreshAll() end)
 
         refreshers[#refreshers + 1] = CycleRow(w, -236, "After a reload or login",
             function() return { { true, "Turn back on by itself" }, { false, "Stay off until I turn on" } } end,
-            function() return cfg.persist end, function(v) cfg.persist = v end, function() end)
+            function() return cfg.persist end, function(v) cfg.persist = v end, function() refreshAll() end)
 
         local note = w:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
         note:SetPoint("BOTTOMLEFT", 24, 22)
