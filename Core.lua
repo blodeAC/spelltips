@@ -2075,6 +2075,95 @@ local function SecretsSnapshot()
     return table.concat(out, "\n")
 end
 
+-- /spelltips curve: can a secret health number still drive a display? Checks which curve helpers exist,
+-- builds a step curve, feeds a secret percent through it, and tries to hand the secret results to widgets.
+-- Every step is reported on its own, so a failure shows exactly where the path stops.
+local function CurveProbe()
+    local out = {}
+    local function add(text) out[#out + 1] = text end
+    local function names(t)
+        local list = {}
+        for k, v in pairs(t) do list[#list + 1] = tostring(k) .. (type(v) == "number" and ("=" .. v) or "") end
+        table.sort(list)
+        return table.concat(list, ", ")
+    end
+    local function step(label, fn, ...)
+        local ok, a, b = pcall(fn, ...)
+        if not ok then add("  " .. label .. ": error: " .. tostring(a)) return nil end
+        add("  " .. label .. ": ok, " .. SecretKind(a))
+        return a, b
+    end
+
+    local version, build = GetBuildInfo()
+    add(string.format("curve probe  client %s build %s  in combat: %s", tostring(version), tostring(build), tostring(InCombatLockdown())))
+    add("C_CurveUtil: " .. (C_CurveUtil and names(C_CurveUtil) or "not present"))
+    add("CurveConstants: " .. (CurveConstants and names(CurveConstants) or "not present"))
+    add("Enum.LuaCurveType: " .. (Enum and Enum.LuaCurveType and names(Enum.LuaCurveType) or "not present"))
+    add("Enum.UnitHealthPercentCurve / related: " .. (Enum and (function()
+        local list = {}
+        for k in pairs(Enum) do if tostring(k):find("Curve") or tostring(k):find("Secret") then list[#list + 1] = tostring(k) end end
+        table.sort(list)
+        return #list > 0 and table.concat(list, ", ") or "none"
+    end)() or "no Enum"))
+    add("")
+
+    -- a step curve over health percent (0..1): three bands
+    local curve
+    if C_CurveUtil and C_CurveUtil.CreateCurve then
+        local okC, c = pcall(C_CurveUtil.CreateCurve)
+        if okC and c then
+            curve = c
+            add("curve object created; methods: " .. (type(getmetatable(c)) == "table" and type(getmetatable(c).__index) == "table"
+                and names(getmetatable(c).__index) or "(unknown)"))
+            if Enum and Enum.LuaCurveType and Enum.LuaCurveType.Step and c.SetType then pcall(c.SetType, c, Enum.LuaCurveType.Step) end
+            if c.AddPoint then
+                pcall(c.AddPoint, c, 0, 0)
+                pcall(c.AddPoint, c, 0.33, 1)
+                pcall(c.AddPoint, c, 0.66, 2)
+            end
+        else
+            add("curve creation failed: " .. tostring(c))
+        end
+    end
+    add("")
+
+    for _, unit in ipairs({ "player", "target" }) do
+        local okExists, exists = pcall(UnitExists, unit)
+        if okExists and exists then
+            add(unit .. ":")
+            local plain = step("UnitHealthPercent (no curve)", UnitHealthPercent, unit)
+            local viaCurve
+            if curve and UnitHealthPercent then
+                viaCurve = step("UnitHealthPercent(unit, false, curve)", UnitHealthPercent, unit, false, curve)
+                if curve.Evaluate then step("curve:Evaluate(secret percent)", curve.Evaluate, curve, plain) end
+            end
+            local secret = viaCurve or plain
+            if secret ~= nil then
+                local okCmp, cmpErr = pcall(function() return secret > 0.5 end)
+                add("  compare secret > 0.5: " .. (okCmp and "allowed" or ("blocked (" .. tostring(cmpErr) .. ")")))
+                local okMath, mathErr = pcall(function() return secret + 1 end)
+                add("  arithmetic on secret: " .. (okMath and "allowed" or ("blocked (" .. tostring(mathErr) .. ")")))
+                local frame = CreateFrame("Frame", nil, UIParent)
+                local fs = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+                local texture = frame:CreateTexture(nil, "OVERLAY")
+                step("frame:SetAlpha(secret)", frame.SetAlpha, frame, secret)
+                step("fontstring:SetAlpha(secret)", fs.SetAlpha, fs, secret)
+                step("texture:SetAlpha(secret)", texture.SetAlpha, texture, secret)
+                step("fontstring:SetText(secret)", fs.SetText, fs, secret)
+                if C_StringUtil and C_StringUtil.FormatNumber then step("FormatNumber(secret)", C_StringUtil.FormatNumber, secret) end
+                if AbbreviateNumbers then step("AbbreviateNumbers(secret)", AbbreviateNumbers, secret) end
+                if fs.SetFormattedText then step("fontstring:SetFormattedText('%s', secret)", fs.SetFormattedText, fs, "%s", secret) end
+                step("frame:GetAlpha() afterwards", frame.GetAlpha, frame)
+            end
+            add("  UnitHealthMissing (secret) into SetText: ")
+            local fs2 = CreateFrame("Frame", nil, UIParent):CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            step("    SetText(UnitHealthMissing)", fs2.SetText, fs2, UnitHealthMissing and UnitHealthMissing(unit))
+            step("    GetText() afterwards", fs2.GetText, fs2)
+        end
+    end
+    return table.concat(out, "\n")
+end
+
 local function EnumListing(filter)
     local out = {}
     local function add(text) out[#out + 1] = text end
@@ -2147,6 +2236,18 @@ SlashCmdList["SPELLTIPS"] = function(msg)
                 print("[spelltips] captured in combat. After the fight, run: /spelltips secrets show")
             else
                 ShowCopyText("SpellTips: health readability", "Press Select all, Ctrl+C, and paste it to the developer.", S.lastSecrets)
+            end
+        end
+    elseif word == "curve" then
+        if rest:lower() == "show" then
+            ShowCopyText("SpellTips: curve probe", "Press Select all, Ctrl+C, and paste it to the developer.",
+                S.lastCurve or "Nothing captured yet. Run /spelltips curve first.")
+        else
+            S.lastCurve = CurveProbe()
+            if InCombatLockdown() then
+                print("[spelltips] captured in combat. After the fight, run: /spelltips curve show")
+            else
+                ShowCopyText("SpellTips: curve probe", "Press Select all, Ctrl+C, and paste it to the developer.", S.lastCurve)
             end
         end
     elseif word == "debug" then
