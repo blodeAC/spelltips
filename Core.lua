@@ -29,6 +29,7 @@ local COLOR = {
     sel        = "ffd100",  -- the talent selected with Alt+wheel
     selNote    = "c8a840",
     heal       = "ffd100",  -- text of the heal labels
+    healFill   = "66ff99",  -- the heal's reach drawn on the health bar
 }
 
 -- Game ids the rules below key on. Spell effect types and aura types are numbers in the game files with
@@ -2272,9 +2273,9 @@ local heal = { entries = {}, ranks = {}, on = false, dirty = false, sinceRebuild
 -- label ("key" = bound key, else rank; "rank"; "both"), frames ("all", "group" = not your own, "mouse" = only
 -- the frame under the cursor), persist (come back after a reload or login), on.
 local HEAL_DEFAULTS = { spell = "all", look = "icon", frames = "all", persist = true, on = false,
-    anchor = "RIGHT", x = -3, y = 0, inside = true, size = 24 }
-local HEAL_ANCHORS = { "RIGHT", "LEFT", "TOP", "BOTTOM", "CENTER", "TOPRIGHT", "TOPLEFT", "BOTTOMRIGHT", "BOTTOMLEFT" }
-local HEAL_OPPOSITE = { RIGHT = "LEFT", LEFT = "RIGHT", TOP = "BOTTOM", BOTTOM = "TOP", CENTER = "CENTER",
+    anchor = "RIGHT", x = -3, y = 0, inside = true, size = 24, preview = true }
+local HEAL_ANCHORS = { "HEALTHBAR", "RIGHT", "LEFT", "TOP", "BOTTOM", "CENTER", "TOPRIGHT", "TOPLEFT", "BOTTOMRIGHT", "BOTTOMLEFT" }
+local HEAL_OPPOSITE = { HEALTHBAR = "LEFT", RIGHT = "LEFT", LEFT = "RIGHT", TOP = "BOTTOM", BOTTOM = "TOP", CENTER = "CENTER",
     TOPRIGHT = "BOTTOMLEFT", TOPLEFT = "BOTTOMRIGHT", BOTTOMRIGHT = "TOPLEFT", BOTTOMLEFT = "TOPRIGHT" }
 local function HealCfg()
     db.heal = type(db.heal) == "table" and db.heal or {}
@@ -2413,7 +2414,7 @@ local function KnownHealRanks()
         local okIcon, icon = pcall(function() return (C_Spell.GetSpellTexture or GetSpellTexture)(r.id) end)
         r.icon = okIcon and icon or nil
         -- main: the big text; small: the corner text (icon look only)
-        if cfg.look == "icon" then r.main, r.small = r.key or "", rankText
+        if cfg.look == "icon" then r.main, r.small, r.dim = r.key or ("r" .. r.number), r.key and rankText or nil, not r.key
         elseif cfg.look == "both" then r.main = (r.key or "-") .. " " .. rankText
         elseif cfg.look == "rank" then r.main = rankText
         else r.main = r.key or rankText end
@@ -2468,6 +2469,35 @@ local function BandCurve(pctLow, pctHigh)
     return curve
 end
 
+-- The status bar that draws a unit frame's health, so a label can follow the end of its fill. The fill is a texture the
+-- engine resizes itself, so anchoring to it needs no health value. Known field names first (Blizzard, oUF, ElvUI...),
+-- then the widest status bar among the frame's children.
+function heal.FindHealthBar(frame)
+    local HEALTH_BAR_FIELDS = { "healthBar", "healthbar", "HealthBar", "Health", "health" }
+    local function isBar(candidate)
+        if type(candidate) ~= "table" or not candidate.IsObjectType or not candidate.GetStatusBarTexture then return false end
+        local okType, isStatus = pcall(candidate.IsObjectType, candidate, "StatusBar")
+        return okType and isStatus == true
+    end
+    for _, field in ipairs(HEALTH_BAR_FIELDS) do
+        local candidate = frame[field]
+        if isBar(candidate) then return candidate end
+    end
+    local best, bestWidth = nil, 0
+    local okKids, kids = pcall(function() return { frame:GetChildren() } end)
+    if okKids then
+        for _, kid in ipairs(kids) do
+            if isBar(kid) then
+                local okSize, width = pcall(kid.GetWidth, kid)
+                if okSize and type(width) == "number" and not (issecretvalue and issecretvalue(width)) and width > bestWidth then
+                    best, bestWidth = kid, width
+                end
+            end
+        end
+    end
+    return best
+end
+
 local function HealFont() return STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF" end
 
 local function HealSetFont(fontString, size)
@@ -2482,7 +2512,18 @@ local function HealPlace(entry)
     local holder = entry.holder
     if not holder then return end
     holder:ClearAllPoints()
-    holder:SetPoint(cfg.inside and cfg.anchor or HEAL_OPPOSITE[cfg.anchor], entry.frame, cfg.anchor, cfg.x, cfg.y)
+    local fill
+    if cfg.anchor == "HEALTHBAR" and entry.bar then
+        local okFill, texture = pcall(entry.bar.GetStatusBarTexture, entry.bar)
+        if okFill and texture then fill = texture end
+    end
+    if fill then
+        -- inside: the label's right edge on the end of the fill; outside: its left edge, over the empty part
+        holder:SetPoint(cfg.inside and "RIGHT" or "LEFT", fill, "RIGHT", cfg.x, cfg.y)
+    else
+        local anchor = cfg.anchor == "HEALTHBAR" and "RIGHT" or cfg.anchor  -- no health bar found: the frame's right edge
+        holder:SetPoint(cfg.inside and anchor or HEAL_OPPOSITE[anchor], entry.frame, anchor, cfg.x, cfg.y)
+    end
     local size = cfg.size
     if cfg.look == "icon" then holder:SetSize(size, size) else holder:SetSize(size * 2.6, size * 0.8) end
 end
@@ -2492,30 +2533,48 @@ local function HealStyle(entry, ranks)
     local cfg = HealCfg()
     local r, g, b = HexToRGB(COLOR.heal)
     local horizontal = cfg.anchor:find("LEFT") and "LEFT" or (cfg.anchor:find("RIGHT") and "RIGHT" or "CENTER")
+    if cfg.anchor == "HEALTHBAR" then horizontal = cfg.inside and "RIGHT" or "LEFT" end
     for i, label in ipairs(entry.labels) do
         local rank = ranks[i]
         label.active = {}
         label.icon:Hide() label.key:Hide() label.small:Hide()
+        if label.fill then label.fill:Hide() end
         if rank then
             label.key:ClearAllPoints() label.small:ClearAllPoints()
-            label.key:SetTextColor(r, g, b)
+            local shade = (cfg.look == "icon" and rank.dim) and 0.65 or 1  -- a rank standing in for a missing key is dimmer
+            label.key:SetTextColor(r * shade, g * shade, b * shade)
             label.small:SetTextColor(r, g, b)
             if cfg.look == "icon" then
                 if rank.icon then label.icon:SetTexture(rank.icon) end
                 label.icon:SetAllPoints(entry.holder)
-                HealSetFont(label.key, cfg.size * 0.55)
-                HealSetFont(label.small, cfg.size * 0.34)
-                label.key:SetPoint("CENTER", entry.holder, "CENTER", 0, 0)
-                label.small:SetPoint("BOTTOMRIGHT", entry.holder, "BOTTOMRIGHT", -1, 1)
+                -- one text, in the top right corner like an action button's hotkey; the rank joins it on big icons
+                HealSetFont(label.key, math.max(9, cfg.size * 0.45))
+                label.key:SetPoint("TOPRIGHT", entry.holder, "TOPRIGHT", -1, -1)
                 label.key:SetText(rank.main)
-                label.small:SetText(rank.small or "")
-                label.active = { label.icon, label.key, label.small }
+                label.active = { label.icon, label.key }
+                if rank.small and cfg.size >= 32 then
+                    HealSetFont(label.small, math.max(9, cfg.size * 0.3))
+                    label.small:SetPoint("BOTTOMRIGHT", entry.holder, "BOTTOMRIGHT", -1, 1)
+                    label.small:SetText(rank.small)
+                    label.active[3] = label.small
+                end
             else
                 HealSetFont(label.key, cfg.size * 0.6)
                 label.key:SetPoint(horizontal, entry.holder, horizontal, 0, 0)
                 label.key:SetJustifyH(horizontal)
                 label.key:SetText(rank.main)
                 label.active = { label.key }
+            end
+            -- the heal's reach: a segment starting where the bar's fill ends, as wide as this rank's average heal
+            local reach = entry.fillW and entry.fillW[i]
+            if cfg.preview and label.fill and entry.fillTexture and reach and reach > 0 then
+                local fr, fg, fb = HexToRGB(COLOR.healFill)
+                label.fill:SetColorTexture(fr, fg, fb, 0.55)
+                label.fill:ClearAllPoints()
+                label.fill:SetPoint("TOPLEFT", entry.fillTexture, "TOPRIGHT", 0, 0)
+                label.fill:SetPoint("BOTTOMLEFT", entry.fillTexture, "BOTTOMRIGHT", 0, 0)
+                label.fill:SetWidth(reach)
+                label.active[#label.active + 1] = label.fill
             end
             for _, region in ipairs(label.active) do region:Show() end
         end
@@ -2559,6 +2618,28 @@ local function HealRebuild()
             end
         end
         entry.unit = found.unit
+        entry.bar = heal.FindHealthBar(found.frame)
+        entry.fillW = entry.fillW or {}
+        entry.fillTexture = nil
+        if entry.bar then
+            local okFill, texture = pcall(entry.bar.GetStatusBarTexture, entry.bar)
+            if okFill and texture then entry.fillTexture = texture end
+            -- a frame the size of the bar that clips what it holds, so a heal bigger than the missing health is cut at the bar's end
+            if not entry.clip then
+                local okClip, clip = pcall(CreateFrame, "Frame", nil, found.frame)
+                if okClip and clip then
+                    entry.clip = clip
+                    pcall(clip.SetClipsChildren, clip, true)
+                end
+            end
+            if entry.clip then
+                pcall(function()
+                    entry.clip:ClearAllPoints()
+                    entry.clip:SetAllPoints(entry.bar)
+                    entry.clip:SetFrameLevel(entry.bar:GetFrameLevel() + 2)
+                end)
+            end
+        end
         if entry.holder then
             for i = #entry.labels + 1, #ranks do
                 local icon = entry.holder:CreateTexture(nil, "OVERLAY")
@@ -2567,9 +2648,18 @@ local function HealRebuild()
                 entry.labels[i] = { icon = icon, key = key, small = small, active = {} }
                 icon:SetAlpha(0) key:SetAlpha(0) small:SetAlpha(0)
             end
+            if entry.clip then
+                for _, label in ipairs(entry.labels) do
+                    if not label.fill then
+                        label.fill = entry.clip:CreateTexture(nil, "OVERLAY")
+                        label.fill:SetAlpha(0)
+                    end
+                end
+            end
             for i = 1, #entry.labels do
                 local rank = ranks[i]
                 entry.curves[i] = nil
+                entry.fillW[i] = nil
                 if rank then
                     -- band in missing health: from (60% of the smallest heal | the previous rank's average) to this rank's average
                     local okMax, max = pcall(UnitHealthMax, entry.unit)
@@ -2580,6 +2670,12 @@ local function HealRebuild()
                         if pctHigh > pctLow and pctHigh > 0 then
                             local okCurve, curve = pcall(BandCurve, pctLow, math.min(pctHigh, 1.0001))
                             entry.curves[i] = okCurve and curve or nil
+                        end
+                        if entry.bar then
+                            local okW, barWidth = pcall(entry.bar.GetWidth, entry.bar)
+                            if okW and type(barWidth) == "number" and not (issecretvalue and issecretvalue(barWidth)) and barWidth > 0 then
+                                entry.fillW[i] = math.min(barWidth, rank.avg / max * barWidth)
+                            end
                         end
                     end
                 end
@@ -2778,12 +2874,12 @@ end
 
 -- The heal label settings, in plain words: a second window opened from the settings window's "Heal labels..." button.
 local healWindow
-local ANCHOR_NAMES = { RIGHT = "Right edge", LEFT = "Left edge", TOP = "Top edge", BOTTOM = "Bottom edge", CENTER = "Center",
+local ANCHOR_NAMES = { HEALTHBAR = "End of the health bar", RIGHT = "Right edge", LEFT = "Left edge", TOP = "Top edge", BOTTOM = "Bottom edge", CENTER = "Center",
     TOPRIGHT = "Top right corner", TOPLEFT = "Top left corner", BOTTOMRIGHT = "Bottom right corner", BOTTOMLEFT = "Bottom left corner" }
 
 function S.ShowHealSettings()
     if not healWindow then
-        local w = NewPanel("SpellTipsHealSettings", 480, 500, "Heal labels")
+        local w = NewPanel("SpellTipsHealSettings", 480, 566, "Heal labels")
         healWindow = w
         w:ClearAllPoints()
         w:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
@@ -2839,7 +2935,7 @@ function S.ShowHealSettings()
             function() return { { "all", "Every frame, mine too" }, { "group", "Party and raid only" }, { "mouse", "Frame under my mouse" } } end,
             function() return cfg.frames end, function(v) cfg.frames = v end, changed)
 
-        refreshers[#refreshers + 1] = CycleRow(w, -236, "Attached to the frame's",
+        refreshers[#refreshers + 1] = CycleRow(w, -236, "Attached to",
             function()
                 local list = {}
                 for _, anchor in ipairs(HEAL_ANCHORS) do list[#list + 1] = { anchor, ANCHOR_NAMES[anchor] } end
@@ -2848,7 +2944,7 @@ function S.ShowHealSettings()
             function() return cfg.anchor end, function(v) cfg.anchor = v end, changed)
 
         refreshers[#refreshers + 1] = CycleRow(w, -270, "Sits",
-            function() return { { true, "Inside the frame" }, { false, "Outside the frame" } } end,
+            function() return { { true, "Inside (on the bar fill)" }, { false, "Outside (past the fill)" } } end,
             function() return cfg.inside end, function(v) cfg.inside = v end, changed)
 
         refreshers[#refreshers + 1] = CycleRow(w, -304, "Size",
@@ -2868,9 +2964,13 @@ function S.ShowHealSettings()
             function() return cfg.persist end, function(v) cfg.persist = v end, function() refreshAll() end)
 
         -- text color
+        refreshers[#refreshers + 1] = CycleRow(w, -372, "Heal reach on the health bar",
+            function() return { { true, "Show how far it heals" }, { false, "Don't show" } } end,
+            function() return cfg.preview end, function(v) cfg.preview = v end, changed)
+
         local swatch = NewButton(w, "", 22, nil)
         swatch:SetSize(22, 22)
-        swatch:SetPoint("TOPLEFT", 24, -376)
+        swatch:SetPoint("TOPLEFT", 24, -412)
         swatch.texture = swatch:CreateTexture(nil, "OVERLAY")
         swatch.texture:SetPoint("TOPLEFT", 4, -4)
         swatch.texture:SetPoint("BOTTOMRIGHT", -4, 4)
@@ -2892,11 +2992,37 @@ function S.ShowHealSettings()
         end)
         local swatchText = w:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
         swatchText:SetPoint("LEFT", swatch, "RIGHT", 8, 0)
-        swatchText:SetText("Text color   (right-click to reset)")
+        swatchText:SetText("Text color")
+
+        local fillSwatch = NewButton(w, "", 22, nil)
+        fillSwatch:SetSize(22, 22)
+        fillSwatch:SetPoint("TOPLEFT", 244, -412)
+        fillSwatch.texture = fillSwatch:CreateTexture(nil, "OVERLAY")
+        fillSwatch.texture:SetPoint("TOPLEFT", 4, -4)
+        fillSwatch.texture:SetPoint("BOTTOMRIGHT", -4, 4)
+        local function paintFill()
+            fillSwatch.texture:SetColorTexture(HexToRGB(COLOR.healFill))
+            if heal.on then pcall(HealRestyle) end
+        end
+        paintFill()
+        refreshers[#refreshers + 1] = paintFill
+        fillSwatch:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        fillSwatch:SetScript("OnClick", function(_, mouse)
+            if mouse == "RightButton" then
+                db.colors.healFill = nil
+                ApplyColors()
+                paintFill()
+            else
+                PickColor("healFill", paintFill)
+            end
+        end)
+        local fillText = w:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        fillText:SetPoint("LEFT", fillSwatch, "RIGHT", 8, 0)
+        fillText:SetText("Heal reach color   (right-click resets either)")
 
         -- moving
         local offset = w:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-        offset:SetPoint("TOPLEFT", 24, -418)
+        offset:SetPoint("TOPLEFT", 24, -452)
         local moveButton
         moveButton = NewButton(w, "Move labels", 120, function()
             if heal.unlock then lock() return end
@@ -2907,7 +3033,7 @@ function S.ShowHealSettings()
             pcall(HealRestyle)
             refreshAll()
         end)
-        moveButton:SetPoint("TOPLEFT", 24, -440)
+        moveButton:SetPoint("TOPLEFT", 24, -474)
         NewButton(w, "Reset position", 120, function()
             cfg.anchor, cfg.x, cfg.y, cfg.inside = HEAL_DEFAULTS.anchor, HEAL_DEFAULTS.x, HEAL_DEFAULTS.y, HEAL_DEFAULTS.inside
             changed()
