@@ -1667,6 +1667,7 @@ local function ShowSettings()
         end
 
         NewButton(w, "Reset all", 100, function() ResetSettings() refreshAll() end):SetPoint("BOTTOMLEFT", 24, 20)
+        NewButton(w, "Heal labels...", 130, function() if S.ShowHealSettings then S.ShowHealSettings() end end):SetPoint("BOTTOMRIGHT", -24, 20)
         local note = w:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
         note:SetPoint("BOTTOM", 0, 52)
         note:SetText("Wheel through talents with the first key held. Right-click a button to go back.")
@@ -2354,7 +2355,12 @@ local function RankRows(name, allowDamage)
         end
     end
     table.sort(rows, function(a, b) return a.avg < b.avg end)
-    for i, r in ipairs(rows) do r.number = r.number or i end
+    local seen, clash = {}, false
+    for _, r in ipairs(rows) do
+        if not r.number or seen[r.number] then clash = true end
+        if r.number then seen[r.number] = true end
+    end
+    for i, r in ipairs(rows) do if clash or not r.number then r.number = i end end
     return rows
 end
 
@@ -2556,8 +2562,12 @@ local function HealDriver()
     return d
 end
 
-local HEAL_HELP = "usage: /spelltips heal [on|off|status]   heal spell <name|all>   heal label <key|rank|both>   "
-    .. "heal frames <all|group|mouse>   heal persist <on|off>"
+local HEAL_HELP = "heal commands:\n"
+    .. "  /spelltips heal  (turn on)    /spelltips heal off    /spelltips heal status\n"
+    .. "  /spelltips heal spell all, or a spell name, e.g. Healing Touch\n"
+    .. "  /spelltips heal label key, rank or both\n"
+    .. "  /spelltips heal frames all, group or mouse\n"
+    .. "  /spelltips heal persist on or off"
 
 local function HealStart()
     if not (C_CurveUtil and C_CurveUtil.CreateCurve and UnitHealthPercent) then
@@ -2573,12 +2583,23 @@ local function HealStart()
 end
 
 local function HealSummary()
-    local parts = {}
-    for _, rank in ipairs(heal.ranks) do parts[#parts + 1] = rank.text .. " ~" .. Fmt(rank.avg) end
     local cfg = HealCfg()
-    return string.format("heal labels %s: spell %s, label %s, frames %s, remembered %s; %d frames, ladder: %s",
-        heal.on and "on" or "off", cfg.spell, cfg.label, cfg.frames, cfg.persist and "yes" or "no", #heal.entries,
-        #parts > 0 and table.concat(parts, "  ") or "no known heals found (try /spelltips heal spell Frostbolt to test)")
+    local lines = { "heal labels are " .. (heal.on and "ON" or "OFF") .. " on " .. #heal.entries .. " frames",
+        "  spells: " .. (cfg.spell == "all" and "all my heals" or cfg.spell) .. "   label: " .. cfg.label
+            .. "   frames: " .. cfg.frames .. "   comes back after reload: " .. (cfg.persist and "yes" or "no") }
+    if #heal.ranks == 0 then
+        lines[#lines + 1] = "  no known heals found. To test on a non-healer: /spelltips heal spell Frostbolt"
+    else
+        lines[#lines + 1] = "  label shows when the missing health is about:"
+        local low = HEAL_MIN_FRACTION * heal.ranks[1].avg
+        for i, rank in ipairs(heal.ranks) do
+            local high = heal.ranks[i + 1] and heal.ranks[i].avg or nil
+            lines[#lines + 1] = string.format("    %s   %s", rank.text,
+                high and (Fmt(low) .. " to " .. Fmt(high)) or (Fmt(low) .. " and up"))
+            low = high or low
+        end
+    end
+    return table.concat(lines, "\n")
 end
 
 local function HealCommand(arg)
@@ -2639,6 +2660,74 @@ local function HealResume()
     local cfg = HealCfg()
     if not (cfg.on and cfg.persist) then return end
     HealStart()
+end
+
+-- The heal label settings, in plain words: a second window opened from the settings window's "Heal labels..." button.
+local healWindow
+function S.ShowHealSettings()
+    if not healWindow then
+        local w = NewPanel("SpellTipsHealSettings", 480, 330, "Heal labels")
+        healWindow = w
+        w:ClearAllPoints()
+        w:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+        local cfg = HealCfg()
+        local refreshers = {}
+        local function refreshAll() for _, fn in ipairs(refreshers) do fn() end end
+        local function apply()
+            if heal.on then
+                heal.dirty = true
+                if not InCombatLockdown() then pcall(HealRebuild) end
+            end
+        end
+
+        local intro = w:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        intro:SetPoint("TOPLEFT", 24, -48)
+        intro:SetWidth(432)
+        intro:SetJustifyH("LEFT")
+        intro:SetText("Puts a small label on each unit frame naming the smallest heal that covers the health that "
+            .. "person is missing, so you can pick a rank at a glance. Left-click a button for the next choice, right-click for the previous.")
+
+        refreshers[#refreshers + 1] = CycleRow(w, -100, "Heal labels",
+            function() return { { true, "On" }, { false, "Off" } } end,
+            function() return heal.on == true end,
+            function(v) if v then HealStart() else HealCommand("off") end end,
+            function() apply() refreshAll() end)
+
+        refreshers[#refreshers + 1] = CycleRow(w, -134, "Heals to cover",
+            function()
+                local list = { { "all", "All the heals I know" } }
+                local found = false
+                for _, name in ipairs(KnownHealNames()) do
+                    list[#list + 1] = { name, name .. " only" }
+                    if name == cfg.spell then found = true end
+                end
+                if cfg.spell ~= "all" and not found then list[#list + 1] = { cfg.spell, cfg.spell .. " only" } end
+                return list
+            end,
+            function() return cfg.spell end, function(v) cfg.spell = v end, apply)
+
+        refreshers[#refreshers + 1] = CycleRow(w, -168, "Label says",
+            function() return { { "key", "The key I press (else rank)" }, { "rank", "The rank number" }, { "both", "Key and rank" } } end,
+            function() return cfg.label end, function(v) cfg.label = v end, apply)
+
+        refreshers[#refreshers + 1] = CycleRow(w, -202, "Show on",
+            function() return { { "all", "Every frame, mine too" }, { "group", "Party and raid only" }, { "mouse", "Frame under my mouse" } } end,
+            function() return cfg.frames end, function(v) cfg.frames = v end, apply)
+
+        refreshers[#refreshers + 1] = CycleRow(w, -236, "After a reload or login",
+            function() return { { true, "Turn back on by itself" }, { false, "Stay off until I turn on" } } end,
+            function() return cfg.persist end, function(v) cfg.persist = v end, function() end)
+
+        local note = w:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        note:SetPoint("BOTTOMLEFT", 24, 22)
+        note:SetWidth(432)
+        note:SetJustifyH("LEFT")
+        note:SetText("The key comes from your action bars (a spell button, or a macro that names the rank). "
+            .. "To try this on a non-healer, type /spelltips heal spell Frostbolt.")
+        w.refreshAll = refreshAll
+    end
+    healWindow.refreshAll()
+    healWindow:Show()
 end
 
 local function EnumListing(filter)
