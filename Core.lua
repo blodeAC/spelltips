@@ -2164,6 +2164,101 @@ local function CurveProbe()
     return table.concat(out, "\n")
 end
 
+-- /spelltips demo: a small movable window that shows whether secret health can drive a display. For each of two
+-- units it draws five health bands (0-20%, 20-40%, ...); a band's label is made visible by a curve that the
+-- client itself evaluates (UnitHealthPercent with a curve), and its alpha is set from the secret result.
+-- Each unit is drawn twice, once with a curve over 0-1 and once over 0-100, because the input scale is not
+-- documented: whichever row tracks the real health is the right one. The "missing" figure is the secret
+-- missing-HP number drawn as text.
+local demo
+local DEMO_BANDS = { { 0, 0.2 }, { 0.2, 0.4 }, { 0.4, 0.6 }, { 0.6, 0.8 }, { 0.8, 1.0001 } }
+
+local function BuildBandCurve(lo, hi, scale)
+    local curve = C_CurveUtil.CreateCurve()
+    curve:SetType(Enum.LuaCurveType.Step)
+    curve:AddPoint(0, lo <= 0 and 1 or 0)
+    if lo > 0 then curve:AddPoint(lo * scale, 1) end
+    curve:AddPoint(hi * scale, 0)
+    return curve
+end
+
+local function DemoToggle()
+    if demo then
+        demo.frame:SetShown(not demo.frame:IsShown())
+        return
+    end
+    if not (C_CurveUtil and C_CurveUtil.CreateCurve and UnitHealthPercent) then
+        print("[spelltips] this client has no curve helpers; nothing to demo")
+        return
+    end
+    local f = CreateFrame("Frame", "SpellTipsDemo", UIParent)
+    f:SetSize(470, 150)
+    f:SetPoint("CENTER", 0, 220)
+    f:SetFrameStrata("DIALOG")
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(0, 0, 0, 0.75)
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", 10, -8)
+    title:SetText("SpellTips demo: bands driven by secret health. Drag to move. /spelltips demo hides it.")
+
+    demo = { frame = f, rows = {}, errorShown = false }
+    local specs = { { "player", 1 }, { "player", 100 }, { "target", 1 }, { "target", 100 } }
+    for i, spec in ipairs(specs) do
+        local row = { unit = spec[1], scale = spec[2], labels = {}, curves = {} }
+        local y = -26 - (i - 1) * 28
+        row.name = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.name:SetPoint("TOPLEFT", 10, y)
+        row.name:SetText(spec[1] .. " curve 0-" .. (spec[2] == 1 and "1" or "100"))
+        for b, band in ipairs(DEMO_BANDS) do
+            local label = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            label:SetPoint("TOPLEFT", 150 + (b - 1) * 52, y)
+            label:SetText(string.format("%d-%d%%", band[1] * 100, math.min(100, band[2] * 100)))
+            label:SetAlpha(0.15)
+            row.labels[b] = label
+            local ok, curve = pcall(BuildBandCurve, band[1], band[2], spec[2])
+            row.curves[b] = ok and curve or nil
+            if not ok then print("[spelltips] curve build failed: " .. tostring(curve)) end
+        end
+        row.missing = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.missing:SetPoint("TOPLEFT", 420, y)
+        demo.rows[i] = row
+    end
+
+    local elapsed = 0
+    f:SetScript("OnUpdate", function(_, dt)
+        elapsed = elapsed + dt
+        if elapsed < 0.1 then return end
+        elapsed = 0
+        for _, row in ipairs(demo.rows) do
+            local okExists, exists = pcall(UnitExists, row.unit)
+            local present = okExists and exists and true or false
+            row.name:SetAlpha(present and 1 or 0.3)
+            if present then
+                for b, curve in ipairs(row.curves) do
+                    local ok, err = pcall(function() row.labels[b]:SetAlpha(UnitHealthPercent(row.unit, false, curve)) end)
+                    if not ok and not demo.errorShown then
+                        demo.errorShown = true
+                        print("[spelltips] demo: " .. tostring(err))
+                    end
+                end
+                pcall(function()
+                    local missing = UnitHealthMissing(row.unit)
+                    row.missing:SetText(AbbreviateNumbers and AbbreviateNumbers(missing) or missing)
+                end)
+            else
+                for b = 1, #row.labels do row.labels[b]:SetAlpha(0.15) end
+                row.missing:SetText("")
+            end
+        end
+    end)
+end
+
 local function EnumListing(filter)
     local out = {}
     local function add(text) out[#out + 1] = text end
@@ -2238,6 +2333,8 @@ SlashCmdList["SPELLTIPS"] = function(msg)
                 ShowCopyText("SpellTips: health readability", "Press Select all, Ctrl+C, and paste it to the developer.", S.lastSecrets)
             end
         end
+    elseif word == "demo" then
+        DemoToggle()
     elseif word == "curve" then
         if rest:lower() == "show" then
             ShowCopyText("SpellTips: curve probe", "Press Select all, Ctrl+C, and paste it to the developer.",
