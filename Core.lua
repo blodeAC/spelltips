@@ -2274,10 +2274,14 @@ local function KnownHealRanks(name)
     for _, id in ipairs(ids or {}) do
         local sd = Data.AddonData[id]
         local okKnown, known = pcall(function() return IsSpellKnown == nil or IsSpellKnown(id) end)
+        -- a heal; failing that a damage effect, so the labels can be tried out with a non-healing spell
         local line
-        for _, k in ipairs(SortedKeys(sd.lines)) do
-            local l = sd.lines[k]
-            if l.type == EFFECT.HEAL and (l.coeff or 0) > 0 then line = l break end
+        for _, wanted in ipairs({ EFFECT.HEAL, EFFECT.SCHOOL_DAMAGE }) do
+            for _, k in ipairs(SortedKeys(sd.lines)) do
+                local l = sd.lines[k]
+                if l.type == wanted and (l.coeff or 0) > 0 then line = l break end
+            end
+            if line then break end
         end
         if line and okKnown and known then
             local c = PredictRange(sd, line)
