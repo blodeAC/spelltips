@@ -443,6 +443,23 @@ end
 
 -- the spell's own effects -> Damage / Healing / aura rows
 local function AddOwnLines(rows, spellData, spellID)
+    -- The melee auto-attack has no damage effect in the game's spell data, so ask the client whether this spell is
+    -- the auto-attack. Kept inside this function: the file is at Lua's limit of 200 top-level locals.
+    local function IsMeleeAutoAttack(spellID)
+        if C_Spell and C_Spell.IsAutoAttackSpell then
+            local ok, result = pcall(C_Spell.IsAutoAttackSpell, spellID)
+            D("auto-attack check C_Spell.IsAutoAttackSpell", spellID, ok, tostring(result))
+            if ok then return result and true or false end
+        end
+        if IsAttackSpell then
+            local name = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellID)
+            local ok, result = pcall(IsAttackSpell, name or spellID)
+            D("auto-attack check IsAttackSpell", spellID, name, ok, tostring(result))
+            if ok then return result and true or false end
+        end
+        D("auto-attack check: client has neither IsAutoAttackSpell nor IsAttackSpell")
+        return false
+    end
     local hasPercentRow = false
     for _, line in pairs(spellData.lines) do
         if line.type == EFFECT.WEAPON_PERCENT then hasPercentRow = true end
@@ -457,6 +474,15 @@ local function AddOwnLines(rows, spellData, spellID)
         elseif (t == EFFECT.WEAPON_DAMAGE_NO_SCHOOL or t == EFFECT.WEAPON_DAMAGE or t == EFFECT.NORMALIZED_WEAPON)
             and not (t == EFFECT.NORMALIZED_WEAPON and hasPercentRow) then
             AddWeaponDamage(rows, spellData, line)
+        end
+    end
+    if next(spellData.lines) == nil and not rows.Damage and IsMeleeAutoAttack(spellID) then
+        local lines, total = WeaponLines(0, false, false)   -- the plain weapon swing, no ability bonus
+        if lines then
+            local row = GetRow(rows, "Damage")
+            row.suffix = "(before armor)"
+            row.values[#row.values + 1] = total
+            for _, l in ipairs(lines) do row.own[#row.own + 1] = l end
         end
     end
     AddAuras(rows, spellID)
