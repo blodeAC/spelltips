@@ -1,5 +1,5 @@
 SpellTipsData = {}
-SpellTipsData.Build = { build = "70840", generated = "2026-11-06" }
+SpellTipsData.Build = { build = "70862", generated = "2026-11-08" }
 SpellTipsData.AddonData = {
     [1] = { name = "Word of Recall (OLD)", classSet = 0, si = 4, lines = {[0] = { base = 3, percent = "100.00%", coeff = 1, per = 0, var = 1.66667, type = 252 }}, talents = {} },
     [4] = { name = "Word of Recall Other", classSet = 0, si = 1, lines = {[0] = { base = 3, percent = "100.00%", coeff = 1, per = 0, var = 1.66667, type = 252 }}, talents = {} },
@@ -12862,9 +12862,9 @@ SpellTipsData.AddonData = {
     [1324463] = { name = "Banish", classSet = 5, si = 6, baseLevel = 0, maxLevel = 0, lines = {}, talents = {} },
     [1324468] = { name = "Subjugate Demon", classSet = 5, si = 6, baseLevel = 0, maxLevel = 0, lines = {}, talents = {} },
     [1324473] = { name = "Bane of Havoc", classSet = 5, si = 6, baseLevel = 0, maxLevel = 0, lines = {}, talents = {{ id = 17778, name = "Cataclysm", maxRank = 3 }, { id = 17917, name = "Destructive Reach", maxRank = 2 }, { id = 1310949, name = "Malevolence", maxRank = 5 }} },
-    [1324474] = { name = "Kidney Shot", classSet = 8, si = 1, baseLevel = 0, maxLevel = 0, lines = {}, talents = {{ id = 14174, name = "Improved Kidney Shot", maxRank = 2 }, { id = 14179, name = "Relentless Strikes", maxRank = 5 }} },
-    [1324475] = { name = "Kidney Shot", classSet = 8, si = 1, baseLevel = 0, maxLevel = 0, lines = {}, talents = {{ id = 14174, name = "Improved Kidney Shot", maxRank = 2 }, { id = 14179, name = "Relentless Strikes", maxRank = 5 }} },
-    [1324481] = { name = "Gouge", classSet = 8, si = 1, baseLevel = 0, maxLevel = 0, lines = {}, talents = {{ id = 13741, name = "Improved Gouge", maxRank = 3 }, { id = 14128, name = "Lethality", maxRank = 2 }} },
+    [1324474] = { name = "Kidney Shot", classSet = 8, si = 1, baseLevel = 30, maxLevel = 0, lines = {}, talents = {{ id = 14174, name = "Improved Kidney Shot", maxRank = 2 }, { id = 14179, name = "Relentless Strikes", maxRank = 5 }} },
+    [1324475] = { name = "Kidney Shot", classSet = 8, si = 1, baseLevel = 50, maxLevel = 0, lines = {}, talents = {{ id = 14174, name = "Improved Kidney Shot", maxRank = 2 }, { id = 14179, name = "Relentless Strikes", maxRank = 5 }} },
+    [1324481] = { name = "Gouge", classSet = 8, si = 1, baseLevel = 60, maxLevel = 0, lines = {}, talents = {{ id = 13741, name = "Improved Gouge", maxRank = 3 }, { id = 14128, name = "Lethality", maxRank = 2 }} },
     [1324482] = { name = "Sap", classSet = 8, si = 1, baseLevel = 0, maxLevel = 0, lines = {}, talents = {{ id = 1224782, name = "Dirty Tricks", maxRank = 2 }} },
     [1324483] = { name = "Sap", classSet = 8, si = 1, baseLevel = 0, maxLevel = 0, lines = {}, talents = {{ id = 1224782, name = "Dirty Tricks", maxRank = 2 }} },
     [1324484] = { name = "Sap", classSet = 8, si = 1, baseLevel = 0, maxLevel = 0, lines = {}, talents = {{ id = 1224782, name = "Dirty Tricks", maxRank = 2 }} },
