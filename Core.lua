@@ -18,7 +18,7 @@ local COLOR = {
     header     = "66ccff",  -- stat row titles
     result     = "00ff00",  -- the total on a row
     pickedName = "c8c8c8",
-    pickedVal  = "a0a0a0",
+    pickedVal  = "707070",  -- the working under a row: base, spellpower, subtotal, picked talents' amounts
     availName  = "808080",
     lockedName = "555555",
     need       = "a05050",  -- "needs N more"
@@ -34,14 +34,14 @@ local COLOR = {
 
 -- Game ids the rules below key on. Spell effect types and aura types are numbers in the game files with
 -- no Lua enum; the weapon slots and the dagger subclass are looked up from the game where it provides them.
-local EFFECT = { SCHOOL_DAMAGE = 2, HEAL = 10, WEAPON_PERCENT = 31, WEAPON_DAMAGE = 58,
+local EFFECT = { SCHOOL_DAMAGE = 2, APPLY_AURA = 6, HEAL = 10, WEAPON_PERCENT = 31, WEAPON_DAMAGE = 58,
                  WEAPON_DAMAGE_NO_SCHOOL = 17, NORMALIZED_WEAPON = 121 }
 -- Forever shrinks the spell-power bonus of healing ranks far below your level: the bonus is multiplied by
 -- 1 - 0.05 * (level - maxLevel - 12), kept between 0 and 1, where maxLevel is the rank's own "MaxLevel" from the
 -- game data. Measured on a level 27 druid (Healing Touch, Rejuvenation, Regrowth); Blizzard has not published it.
 -- Damage spells showed no penalty in the game's own descriptions, so it is not applied to them.
 local RANK_PENALTY_STEP, RANK_PENALTY_GRACE = 0.05, 12
-local AURA = { HEAL_OVER_TIME = 8, MOD_THREAT = 10, PERCENT_DAMAGE = 79, FLAT_MOD = 107, PERCENT_MOD = 108 }
+local AURA = { PERIODIC_DAMAGE = 3, HEAL_OVER_TIME = 8, MOD_THREAT = 10, PERCENT_DAMAGE = 79, FLAT_MOD = 107, PERCENT_MOD = 108 }
 local SLOT_MAINHAND, SLOT_RANGED = 16, 18
 local DAGGER = (Enum and Enum.ItemWeaponSubclass and Enum.ItemWeaponSubclass.Dagger) or 15
 -- Normalized attacks (effect 121) count attack power at a fixed speed by weapon type, in seconds.
@@ -247,7 +247,7 @@ local function ReadLive(key, fn, ...)
 end
 
 local function SpellPowerFor(spellData, line)
-    if line.type == EFFECT.HEAL then
+    if line.type == EFFECT.HEAL or line.aura == AURA.HEAL_OVER_TIME then
         return ReadLive("healing", GetSpellBonusHealing) or 0
     end
     local school = spellData.si or 1
@@ -404,15 +404,63 @@ local function GetRow(rows, name)
     return row
 end
 
+-- One damage or healing effect, laid out as a sum then a product:
+--   Base / Spellpower (and any flat talents), a line with the subtotal, then the picked talents that
+--   multiply it, then the tick count for a periodic effect. The total on the row includes all of it.
+-- Periodic effects (aura 3 damage, aura 8 healing) are per tick; ticks = duration / period, both in ms
+-- from Data.lua (line.dur, line.period). Without them the row shows the per-tick amount.
 local function AddSpellDamage(rows, spellData, line)
+    local function R(x) return tostring(math.floor(x + 0.5)) end
+    local function Range(lo, hi) return R(lo) == R(hi) and R(lo) or (R(lo) .. "-" .. R(hi)) end
+    local heal = line.type == EFFECT.HEAL or line.aura == AURA.HEAL_OVER_TIME
+    local periodic = line.type == EFFECT.APPLY_AURA
+    local each = periodic and " per tick" or ""
+
     local c = PredictRange(spellData, line)
-    local row = GetRow(rows, line.type == EFFECT.HEAL and "Healing" or "Damage")
-    row.values[#row.values + 1] = Fmt(c.scaled - c.half + c.bonus) .. "-" .. Fmt(c.scaled + c.half + c.bonus)
-    row.own[#row.own + 1] = {
-        n = Fmt(c.scaled) .. (c.half >= 0.05 and (" ±" .. Fmt(c.half)) or "") .. " base + " .. Fmt(c.bonus)
-            .. " spellpower (" .. Fmt((line.coeff or 0) * 100) .. "% × " .. Fmt(c.sp)
-            .. (c.factor < 1 and (" × " .. Fmt(c.factor * 100) .. "% for a low rank") or "") .. ")",
-    }
+    local talents = S.DamageTalents and S.DamageTalents(spellData) or {}
+    local scope = talents[periodic and "periodic" or "direct"] or { mult = 1, flat = 0, ids = {} }
+    local dur = line.dur and talents.dur and (line.dur + talents.dur.flat) * talents.dur.mult or line.dur
+    local ticks = periodic and (line.period or 0) > 0 and (dur or 0) > 0 and math.floor(dur / line.period + 0.0001) or nil
+
+    local row = GetRow(rows, heal and "Healing" or "Damage")
+    local own = row.own
+    -- A spell with a hit and a DoT gets two blocks; name them so the two "Base" lines can be told apart.
+    -- The first block is only named once a second one arrives.
+    local kind = periodic and "Over time" or "Immediate"
+    if #own > 0 then
+        if not row.named then
+            table.insert(own, 1, { h = row.kind })
+            row.named = true
+        end
+        own[#own + 1] = { h = kind }
+    end
+    row.kind = row.kind or kind
+    row.joiner = " + "
+    own[#own + 1] = { l = "Base", v = Range(c.scaled - c.half, c.scaled + c.half) .. each }
+    if c.bonus >= 0.05 then
+        own[#own + 1] = {
+            l = (heal and "Healing power (" or "Spellpower (") .. Fmt(c.sp) .. " × " .. Fmt((line.coeff or 0) * 100) .. "%"
+                .. (c.factor < 1 and (" × " .. Fmt(c.factor * 100) .. "% low rank") or "") .. ")",
+            v = "+" .. R(c.bonus) .. each,
+        }
+    end
+    if scope.flat ~= 0 then own[#own + 1] = { talents = { op = "+", ids = scope.ids }, combined = (scope.flat > 0 and "+" or "") .. R(scope.flat) .. each } end
+
+    local lo = c.scaled - c.half + c.bonus + scope.flat
+    local hi = c.scaled + c.half + c.bonus + scope.flat
+    if math.abs(scope.mult - 1) >= 0.0005 then
+        local pct = (scope.mult - 1) * 100
+        own[#own + 1] = { sep = Range(lo, hi) .. each }
+        own[#own + 1] = { talents = { op = "x", ids = scope.ids }, combined = (pct >= 0 and "+" or "-") .. Fmt(math.abs(pct)) .. "%" }
+    end
+    lo, hi = lo * scope.mult, hi * scope.mult
+
+    if ticks then
+        own[#own + 1] = { l = "Ticks", v = ticks .. ", every " .. Fmt(line.period / 1000) .. " sec" }
+        row.values[#row.values + 1] = Range(lo * ticks, hi * ticks) .. " over " .. Fmt(dur / 1000) .. " sec"
+    else
+        row.values[#row.values + 1] = Range(lo, hi) .. each
+    end
 end
 
 local function AddWeaponDamage(rows, spellData, line)
@@ -469,7 +517,9 @@ local function AddOwnLines(rows, spellData, spellID)
     for _, idx in ipairs(SortedKeys(spellData.lines)) do
         local line = spellData.lines[idx]
         local t = line.type
-        if (t == EFFECT.SCHOOL_DAMAGE or t == EFFECT.HEAL) and (line.coeff or 0) > 0 and not (t == EFFECT.SCHOOL_DAMAGE and physical) then
+        local periodic = t == EFFECT.APPLY_AURA and (line.aura == AURA.PERIODIC_DAMAGE or line.aura == AURA.HEAL_OVER_TIME)
+        local damage = t == EFFECT.SCHOOL_DAMAGE or line.aura == AURA.PERIODIC_DAMAGE
+        if (t == EFFECT.SCHOOL_DAMAGE or t == EFFECT.HEAL or periodic) and (line.coeff or 0) > 0 and not (damage and physical) then
             AddSpellDamage(rows, spellData, line)
         elseif (t == EFFECT.WEAPON_DAMAGE_NO_SCHOOL or t == EFFECT.WEAPON_DAMAGE or t == EFFECT.NORMALIZED_WEAPON)
             and not (t == EFFECT.NORMALIZED_WEAPON and hasPercentRow) then
@@ -489,7 +539,9 @@ local function AddOwnLines(rows, spellData, spellID)
 end
 
 -- Live totals from the client for rows that talents touch. These already include picked talents.
-local function AddApiValues(rows, spellID)
+-- Cast time also gets the spell's base time (Data.lua "cast", ms, from SpellCastTimes) and the player's
+-- spell haste, the two things besides talents that set it: client time = base after talents / (1 + haste%).
+local function AddApiValues(rows, spellID, spellData)
     local function put(row, value, unit)
         if rows[row] and value > 0 then
             local values = rows[row].values
@@ -497,7 +549,20 @@ local function AddApiValues(rows, spellID)
         end
     end
     local info = C_Spell.GetSpellInfo(spellID) or {}
-    put("Cast time", (info.castTime or 0) / 1000, " sec")
+    local cast = rows["Cast time"]
+    if cast and info.castTime then
+        local ms = info.castTime
+        -- two decimals: haste makes 2.94 sec, which one decimal would show as a 0.1 sec change
+        cast.values[#cast.values + 1] = ms > 0 and ((string.format("%.2f", ms / 1000):gsub("0+$", ""):gsub("%.$", "")) .. " sec") or "Instant"
+        local base = spellData and spellData.cast
+        if base and base > 0 then
+            cast.own[#cast.own + 1] = { l = "Base", v = Fmt(base / 1000) .. " sec" }
+        end
+        local haste = ms > 0 and ReadLive("spellHaste", UnitSpellHaste, "player")
+        if haste and math.abs(haste) >= 0.05 then
+            cast.own[#cast.own + 1] = { l = "Haste", v = (haste > 0 and "+" or "") .. Fmt(haste) .. "%" }
+        end
+    end
     put("Range", info.maxRange or 0, " yd")
 
     local cost = (C_Spell.GetSpellPowerCost(spellID) or {})[1]
@@ -509,7 +574,8 @@ local function AddApiValues(rows, spellID)
 end
 
 -- Hit: the client reports gear only (talents are not included), so picked "+N%" talents are added.
--- Crit: the client's total chance.
+-- Crit: the client's chance is school-wide; picked talents that add crit to this spell are added to it,
+-- with the client's own figure shown as "Character sheet" so the sum can be checked.
 local function AddHitCrit(rows, spellData)
     local melee = spellData.si == 1
     local hit = rows["Hit"]
@@ -528,7 +594,11 @@ local function AddHitCrit(rows, spellData)
         local getCrit = melee and GetCritChance or GetSpellCritChance
         local school = spellData.si or 1
         local chance = ReadLive("crit" .. (melee and "M" or "S") .. school, getCrit, school)
-        if chance then crit.values[#crit.values + 1] = Fmt(chance) .. "%" end
+        if chance then
+            local talents = S.DamageTalents and S.DamageTalents(spellData).crit or 0
+            crit.values[#crit.values + 1] = Fmt(chance + talents) .. "%"
+            if talents ~= 0 then crit.own[#crit.own + 1] = { l = "Character sheet", v = Fmt(chance) .. "%" } end
+        end
     end
 end
 
@@ -755,6 +825,60 @@ local function TalentEffects(t, st, rank, spellData, spellID)
     S.sources[t.id] = { source = effects and "game data" or "engine text", text = text, rank = rank }
     D("talent", t.name, "rank", rank, effects and Summarize(effects) or "-> engine text")
     return effects or {}, text
+end
+
+-- Picked talents that change this spell's damage or healing amount, from their modifier rows:
+-- percent rows (aura 108) multiply, flat rows (aura 107) add. Property 0 is direct effects, 22 periodic.
+-- Talents stack by multiplying (the game's Corruption total matches 1.1 x 1.1, not 1.2).
+-- Runs at every tooltip level, so the total is right even when the talents are not drawn.
+-- Kept on S: the file is at Lua's limit of 200 top-level locals.
+-- Also sums flat crit-chance rows (aura 107, property 7): the client's GetSpellCritChance is the same for
+-- every school (checked on a shaman: all schools 5.99% with Call of Thunder 1/1), so a talent that adds crit
+-- to particular spells is not in it.
+-- And duration rows (property 1: flat ms, or percent), which change how many times a periodic effect ticks
+-- (Call of Flame: +9 sec on Flame Shock, 12 -> 21 sec, 4 -> 7 ticks, matching the game's text).
+-- Returns { direct = { mult, flat, ids = { [talentID] = "x" | "+" } }, periodic = { ... }, crit = points,
+--           dur = { flat = ms, mult = n } }
+S.DamageTalents = function(spellData)
+    local out = { direct = { mult = 1, flat = 0, ids = {} }, periodic = { mult = 1, flat = 0, ids = {} }, crit = 0,
+                  dur = { flat = 0, mult = 1 } }
+    local seen = {}
+    for _, t in ipairs(spellData.talents or {}) do
+        local mods = Data.Mods and Data.Mods[t.id]
+        if mods and not seen[t.id] and not t.via and not t.raw then
+            seen[t.id] = true
+            local st = GetTalentState(t.id)
+            if st and st.rank > 0 then
+                local defRanks = Data.Ranks and st.definitionID and Data.Ranks[st.definitionID]
+                for _, i in ipairs(t.rows or SortedKeys(mods)) do
+                    local mod = mods[i]
+                    local scope = mod and ((mod.prop == 0 and out.direct) or (mod.prop == 22 and out.periodic))
+                    if mod and mod.prop == 7 and mod.aura == AURA.FLAT_MOD and not SignDisagrees(mod, defRanks) then
+                        out.crit = out.crit + ModAmount(mod, st.rank, defRanks)
+                    end
+                    if mod and mod.prop == 1 and not SignDisagrees(mod, defRanks) then
+                        local amount = ModAmount(mod, st.rank, defRanks)
+                        if mod.aura == AURA.FLAT_MOD then
+                            out.dur.flat = out.dur.flat + amount
+                        elseif mod.aura == AURA.PERCENT_MOD then
+                            out.dur.mult = out.dur.mult * (1 + amount / 100)
+                        end
+                    end
+                    if scope and not SignDisagrees(mod, defRanks) then
+                        local amount = ModAmount(mod, st.rank, defRanks)
+                        if mod.aura == AURA.PERCENT_MOD then
+                            scope.mult = scope.mult * (1 + amount / 100)
+                            scope.ids[t.id] = "x"
+                        elseif mod.aura == AURA.FLAT_MOD then
+                            scope.flat = scope.flat + amount
+                            scope.ids[t.id] = scope.ids[t.id] or "+"
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return out
 end
 
 -- /spelltips verify: for every talent with modifier rows in the data, at every rank, check that each number
@@ -998,17 +1122,48 @@ local function ByNeedThenName(a, b)
     return a.name < b.name
 end
 
+-- Talent values sit in the right column. Picked talents that add to or multiply a damage/healing amount are
+-- drawn inside that amount's math ("+ name" above the subtotal line, "× name" below it); every other talent
+-- follows the row's own lines. An unpicked talent shows its one-rank value, dimmed, marked "per rank".
 local function DrawRow(tooltip, name, row)
-    Header(tooltip, name, row.suffix, #row.values > 0 and table.concat(row.values, ", ") or nil)
-    for _, s in ipairs(row.own) do
-        if s.l then Pair(tooltip, "  " .. s.l, s.v, 0.6) end
-        if s.n then Line(tooltip, "  " .. Color(COLOR.note, s.n), true) end
-    end
+    Header(tooltip, name, row.suffix, #row.values > 0 and table.concat(row.values, row.joiner or ", ") or nil)
     table.sort(row.mods, ByPickedThenName)
-    for _, m in ipairs(row.mods) do
+    -- The working under a row (base, spellpower, subtotal, talents) shares the right column with the green
+    -- total, so its values are drawn dim: the total is the brightest thing on the edge.
+    local function Work(left, right, shade, hex) Pair(tooltip, left, Color(hex or COLOR.pickedVal, right or ""), shade) end
+    -- with named blocks (Immediate / Over time) each block's lines sit two spaces further in than its name
+    local pad = row.named and "    " or "  "
+    local drawn = {}
+    local function Mod(m, op)
+        drawn[m] = true
         local nameHex, bullet = Pick(m.id, m.picked and COLOR.pickedName or COLOR.availName)
-        local valHex = m.picked and COLOR.pickedVal or COLOR.dim
-        Line(tooltip, "  " .. Color(nameHex, TalentLabel(bullet, m)) .. Bar() .. Color(valHex, m.comp), true)
+        -- inside the math the × / + takes the bullet's place; the Alt+wheel selection marker still wins
+        if bullet == "•" and op then bullet = op == "x" and "×" or "+" end
+        local value = m.comp .. ((not m.picked and (m.max or 0) > 1) and " per rank" or "")
+        Work((op and pad or "  ") .. Color(nameHex, TalentLabel(bullet, m)), value, nil, not m.picked and COLOR.dim or nil)
+    end
+    for _, s in ipairs(row.own) do
+        if s.talents then
+            local any = false
+            for _, m in ipairs(row.mods) do
+                if m.picked and s.talents.ids[m.id] == s.talents.op then
+                    Mod(m, s.talents.op)
+                    any = true
+                end
+            end
+            -- talents not drawn at this level: still say what they did to the total
+            if not any then Work(pad .. (s.talents.op == "x" and "× " or "+ ") .. "talents", s.combined, 0.6) end
+        elseif s.h then
+            Line(tooltip, "  " .. Color(COLOR.note, s.h))
+        elseif s.sep then
+            Work(pad .. Color(COLOR.bar, string.rep("-", 24)), s.sep, 0.6)
+        else
+            if s.l then Work(pad .. s.l, s.v, 0.6) end
+            if s.n then Line(tooltip, pad .. Color(COLOR.note, s.n), true) end
+        end
+    end
+    for _, m in ipairs(row.mods) do
+        if not drawn[m] then Mod(m) end
     end
 end
 
@@ -1189,7 +1344,7 @@ local function DrawSpellTips(tooltip, data)
     end
     Guard("aura rows", PruneAuraRows, rows)
     Guard("proc notes", AddProcNotes, rows, spellData)
-    Guard("api values", AddApiValues, rows, spellID)
+    Guard("api values", AddApiValues, rows, spellID, spellData)
     Guard("hit and crit", AddHitCrit, rows, spellData)
     if tooltip ~= preview.tooltip then  -- the preview must not replace what /spelltips report describes
         S.last = { id = spellID, name = C_Spell.GetSpellName(spellID), via = via, level = S.level,
@@ -1502,7 +1657,7 @@ local LEVEL_OPTIONS = { { 0, "Off (hold a key)" }, { 1, "Numbers only" }, { 2, "
 
 local COLOR_LABELS = {
     { "header", "Row names (Damage, Cost...)" },     { "result", "Row totals (right side)" },
-    { "pickedName", "Talents you have picked" },     { "pickedVal", "Their amounts" },
+    { "pickedName", "Talents you have picked" },     { "pickedVal", "Working under a row (base, talents...)" },
     { "availName", "Talents you could take" },       { "dim", "Amounts of talents not taken, hints" },
     { "lockedName", "Locked talents" },              { "need", "\"needs N more\"" },
     { "section", "Headings (LOCKED, tree names)" },  { "note", "Detail text under a row, Other" },
