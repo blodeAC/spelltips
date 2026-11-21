@@ -512,19 +512,35 @@ local function AddOwnLines(rows, spellData, spellID)
     for _, line in pairs(spellData.lines) do
         if line.type == EFFECT.WEAPON_PERCENT then hasPercentRow = true end
     end
-    local physical = (spellData.si or 1) == 1
+    -- a spell-power damage or heal effect (direct or periodic) of spell sd: true when it was added
+    local function SpellAmount(sd, line)
+        local t = line.type
+        local periodic = t == EFFECT.APPLY_AURA and (line.aura == AURA.PERIODIC_DAMAGE or line.aura == AURA.HEAL_OVER_TIME)
+        local damage = t == EFFECT.SCHOOL_DAMAGE or line.aura == AURA.PERIODIC_DAMAGE
+        if (t == EFFECT.SCHOOL_DAMAGE or t == EFFECT.HEAL or periodic) and (line.coeff or 0) > 0
+            and not (damage and (sd.si or 1) == 1) then
+            AddSpellDamage(rows, sd, line)
+            return true
+        end
+    end
 
     for _, idx in ipairs(SortedKeys(spellData.lines)) do
         local line = spellData.lines[idx]
         local t = line.type
-        local periodic = t == EFFECT.APPLY_AURA and (line.aura == AURA.PERIODIC_DAMAGE or line.aura == AURA.HEAL_OVER_TIME)
-        local damage = t == EFFECT.SCHOOL_DAMAGE or line.aura == AURA.PERIODIC_DAMAGE
-        if (t == EFFECT.SCHOOL_DAMAGE or t == EFFECT.HEAL or periodic) and (line.coeff or 0) > 0 and not (damage and physical) then
-            AddSpellDamage(rows, spellData, line)
+        if SpellAmount(spellData, line) then
+            -- added
         elseif (t == EFFECT.WEAPON_DAMAGE_NO_SCHOOL or t == EFFECT.WEAPON_DAMAGE or t == EFFECT.NORMALIZED_WEAPON)
             and not (t == EFFECT.NORMALIZED_WEAPON and hasPercentRow) then
             AddWeaponDamage(rows, spellData, line)
         end
+    end
+    -- Amounts that live in another spell, named by this spell's own description token ($26367s1 in Lightning
+    -- Shield's text): the generator wrote them as shows = {{ id, idx }}. The math uses that spell's own entry
+    -- (base, coefficient, level range, talents).
+    for _, ref in ipairs(spellData.shows or {}) do
+        local sd = Data.AddonData[ref.id]
+        local line = sd and sd.lines[ref.idx]
+        if line then SpellAmount(sd, line) end
     end
     if next(spellData.lines) == nil and not rows.Damage and IsMeleeAutoAttack(spellID) then
         local lines, total = WeaponLines(0, false, false)   -- the plain weapon swing, no ability bonus
