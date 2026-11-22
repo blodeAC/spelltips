@@ -259,7 +259,10 @@ local function RankFactor(spellData, line)
     local maxLevel = spellData.maxLevel or 0
     if maxLevel <= 0 or not (line.type == EFFECT.HEAL or line.aura == AURA.HEAL_OVER_TIME) then return 1 end
     local over = (UnitLevel("player") or 1) - maxLevel - RANK_PENALTY_GRACE
-    return math.min(1, math.max(0, 1 - over * RANK_PENALTY_STEP))
+    -- never below 10%: Healing Wave ranks 1 and 2 at level 42 get 10% where the 5%-per-level slope reaches 0% and 5%
+    -- (ranks 3-6 match the slope: 35%, 65%, 95%, 100%). Damage spells get no penalty (Earth Shock rank 3, 28 levels
+    -- below, gets its full bonus).
+    return math.min(1, math.max(0.1, 1 - over * RANK_PENALTY_STEP))
 end
 
 -- spell damage: scaled base * (1 +/- variance/2) + coefficient * spellpower * rank factor
@@ -411,7 +414,10 @@ end
 -- from Data.lua (line.dur, line.period). Without them the row shows the per-tick amount.
 local function AddSpellDamage(rows, spellData, line)
     local function R(x) return tostring(math.floor(x + 0.5)) end
-    local function Range(lo, hi) return R(lo) == R(hi) and R(lo) or (R(lo) .. "-" .. R(hi)) end
+    -- Final amounts are rounded down, the way the game does it; 0.0005 of slack keeps float noise like
+    -- 830.9999996 from losing a point.
+    local function F(x) return tostring(math.floor(x + 0.0005)) end
+    local function Range(lo, hi) return F(lo) == F(hi) and F(lo) or (F(lo) .. "-" .. F(hi)) end
     local heal = line.type == EFFECT.HEAL or line.aura == AURA.HEAL_OVER_TIME
     local periodic = line.type == EFFECT.APPLY_AURA
     local each = periodic and " per tick" or ""
@@ -421,6 +427,20 @@ local function AddSpellDamage(rows, spellData, line)
     local scope = talents[periodic and "periodic" or "direct"] or { mult = 1, flat = 0, ids = {} }
     local dur = line.dur and talents.dur and (line.dur + talents.dur.flat) * talents.dur.mult or line.dur
     local ticks = periodic and (line.period or 0) > 0 and (dur or 0) > 0 and math.floor(dur / line.period + 0.0001) or nil
+    -- The base range, the game's way (fits 20 of 21 tooltips on a level 42 shaman, damage and heals; Chain
+    -- Lightning's high end comes out 1 over):
+    --   low end  = round(unscaled base x (1 - variance / 2))
+    --   high end = round(unscaled base x (1 + variance / 2)) + 1      (no +1 when there is no variance)
+    --   both     + per-level step x levels, unrounded
+    -- then the spellpower bonus is added unrounded, talents multiply, and the result is rounded down (F).
+    local unscaled, var = line.base or 0, line.var or 0
+    local levelBonus = c.scaled - unscaled
+    local baseLo, baseHi = c.scaled, c.scaled
+    if var > 0 then
+        baseLo = math.floor(unscaled * (1 - var / 2) + 0.5) + levelBonus
+        baseHi = math.floor(unscaled * (1 + var / 2) + 0.5) + 1 + levelBonus
+    end
+    local bonus = c.bonus
 
     local row = GetRow(rows, heal and "Healing" or "Damage")
     local own = row.own
@@ -436,18 +456,18 @@ local function AddSpellDamage(rows, spellData, line)
     end
     row.kind = row.kind or kind
     row.joiner = " + "
-    own[#own + 1] = { l = "Base", v = Range(c.scaled - c.half, c.scaled + c.half) .. each }
+    own[#own + 1] = { l = "Base", v = Range(baseLo, baseHi) .. each }
     if c.bonus >= 0.05 then
         own[#own + 1] = {
             l = (heal and "Healing power (" or "Spellpower (") .. Fmt(c.sp) .. " × " .. Fmt((line.coeff or 0) * 100) .. "%"
                 .. (c.factor < 1 and (" × " .. Fmt(c.factor * 100) .. "% low rank") or "") .. ")",
-            v = "+" .. R(c.bonus) .. each,
+            v = "+" .. R(bonus) .. each,
         }
     end
     if scope.flat ~= 0 then own[#own + 1] = { talents = { op = "+", ids = scope.ids }, combined = (scope.flat > 0 and "+" or "") .. R(scope.flat) .. each } end
 
-    local lo = c.scaled - c.half + c.bonus + scope.flat
-    local hi = c.scaled + c.half + c.bonus + scope.flat
+    local lo = baseLo + bonus + scope.flat
+    local hi = baseHi + bonus + scope.flat
     if math.abs(scope.mult - 1) >= 0.0005 then
         local pct = (scope.mult - 1) * 100
         own[#own + 1] = { sep = Range(lo, hi) .. each }
