@@ -450,7 +450,10 @@ end
 --   multiply it, then the tick count for a periodic effect. The total on the row includes all of it.
 -- Periodic effects (aura 3 damage, aura 8 healing) are per tick; ticks = duration / period, both in ms
 -- from Data.lua (line.dur, line.period). Without them the row shows the per-tick amount.
-local function AddSpellDamage(rows, spellData, line)
+-- tick: { period = ms, dur = ms } for an amount another spell repeats (Consecration hits with 1280345 every
+-- second for 8 sec); the amount itself is a plain hit, so its talents are still the direct ones.
+-- kindName: the block's heading when the row gets more than one block.
+local function AddSpellDamage(rows, spellData, line, tick, kindName)
     local function R(x) return tostring(math.floor(x + 0.5)) end
     -- Final amounts are rounded down, the way the game does it; 0.0005 of slack keeps float noise like
     -- 830.9999996 from losing a point.
@@ -458,13 +461,16 @@ local function AddSpellDamage(rows, spellData, line)
     local function Range(lo, hi) return F(lo) == F(hi) and F(lo) or (F(lo) .. "-" .. F(hi)) end
     local heal = line.type == EFFECT.HEAL or line.aura == AURA.HEAL_OVER_TIME
     local periodic = line.type == EFFECT.APPLY_AURA
-    local each = periodic and " per tick" or ""
+    local ticking = periodic or tick ~= nil
+    local each = ticking and " per tick" or ""
 
     local c = PredictRange(spellData, line)
     local talents = S.DamageTalents and S.DamageTalents(spellData) or {}
     local scope = talents[periodic and "periodic" or "direct"] or { mult = 1, flat = 0, ids = {} }
-    local dur = line.dur and talents.dur and (line.dur + talents.dur.flat) * talents.dur.mult or line.dur
-    local ticks = periodic and (line.period or 0) > 0 and (dur or 0) > 0 and math.floor(dur / line.period + 0.0001) or nil
+    local period = tick and tick.period or line.period
+    local rawDur = tick and tick.dur or line.dur
+    local dur = rawDur and talents.dur and (rawDur + talents.dur.flat) * talents.dur.mult or rawDur
+    local ticks = ticking and (period or 0) > 0 and (dur or 0) > 0 and math.floor(dur / period + 0.0001) or nil
     -- The base range, the game's way (fits 20 of 21 tooltips on a level 42 shaman, damage and heals; Chain
     -- Lightning's high end comes out 1 over):
     --   low end  = round(unscaled base x (1 - variance / 2))
@@ -484,7 +490,7 @@ local function AddSpellDamage(rows, spellData, line)
     local own = row.own
     -- A spell with a hit and a DoT gets two blocks; name them so the two "Base" lines can be told apart.
     -- The first block is only named once a second one arrives.
-    local kind = periodic and "Over time" or "Immediate"
+    local kind = kindName or (ticking and "Over time" or "Immediate")
     if #own > 0 then
         if not row.named then
             table.insert(own, 1, { h = row.kind })
@@ -514,7 +520,7 @@ local function AddSpellDamage(rows, spellData, line)
     lo, hi = lo * scope.mult, hi * scope.mult
 
     if ticks then
-        own[#own + 1] = { l = "Ticks", v = ticks .. ", every " .. Fmt(line.period / 1000) .. " sec" }
+        own[#own + 1] = { l = "Ticks", v = ticks .. ", every " .. Fmt(period / 1000) .. " sec" }
         row.values[#row.values + 1] = Range(lo * ticks, hi * ticks) .. " over " .. Fmt(dur / 1000) .. " sec"
     else
         row.values[#row.values + 1] = Range(lo, hi) .. each
@@ -612,10 +618,21 @@ local function AddOwnLines(rows, spellData, spellID)
     -- Amounts that live in another spell, named by this spell's own description token ($26367s1 in Lightning
     -- Shield's text): the generator wrote them as shows = {{ id, idx }}. The math uses that spell's own entry
     -- (base, coefficient, level range, talents).
+    -- A ref with a period is an amount this spell repeats with its own periodic aura (Consecration); it may
+    -- have no coefficient (Consecration's 2 to every enemy), so it goes straight to AddSpellDamage.
+    local ticking = {}
+    for _, ref in ipairs(spellData.shows or {}) do
+        if ref.period then ticking[#ticking + 1] = ref end
+    end
     for _, ref in ipairs(spellData.shows or {}) do
         local sd = Data.AddonData[ref.id]
         local line = sd and sd.lines[ref.idx]
-        if line then SpellAmount(sd, line) end
+        if line and ref.period then
+            local part = #ticking > 1 and ("Over time, part " .. (ref.idx + 1)) or nil
+            AddSpellDamage(rows, sd, line, { period = ref.period, dur = ref.dur }, part)
+        elseif line then
+            SpellAmount(sd, line)
+        end
     end
     if next(spellData.lines) == nil and not rows.Damage and IsMeleeAutoAttack(spellID) then
         local lines, total = WeaponLines({}, false, false)   -- the plain weapon swing, no ability bonus
