@@ -458,7 +458,12 @@ local function AddSpellDamage(rows, spellData, line, tick, kindName)
     -- Final amounts are rounded down, the way the game does it; 0.0005 of slack keeps float noise like
     -- 830.9999996 from losing a point.
     local function F(x) return tostring(math.floor(x + 0.0005)) end
-    local function Range(lo, hi) return F(lo) == F(hi) and F(lo) or (F(lo) .. "-" .. F(hi)) end
+    -- the high end's +1 (spells with variance) comes after talents and rounding down, see below
+    local hiPlus = 0
+    local function Range(lo, hi)
+        local l, h = F(lo), tostring(tonumber(F(hi)) + hiPlus)
+        return l == h and l or (l .. "-" .. h)
+    end
     local heal = line.type == EFFECT.HEAL or line.aura == AURA.HEAL_OVER_TIME
     local periodic = line.type == EFFECT.APPLY_AURA
     local ticking = periodic or tick ~= nil
@@ -471,18 +476,22 @@ local function AddSpellDamage(rows, spellData, line, tick, kindName)
     local rawDur = tick and tick.dur or line.dur
     local dur = rawDur and talents.dur and (rawDur + talents.dur.flat) * talents.dur.mult or rawDur
     local ticks = ticking and (period or 0) > 0 and (dur or 0) > 0 and math.floor(dur / period + 0.0001) or nil
-    -- The base range, the game's way (fits 20 of 21 tooltips on a level 42 shaman, damage and heals; Chain
-    -- Lightning's high end comes out 1 over):
+    -- The range, the game's way. Checked against the game's own descriptions (C_Spell.GetSpellDescription) for
+    -- all 65 ranks of a level 46 shaman's Lightning Bolt, Chain Lightning, Earth Shock, Lava Burst, Frost Shock,
+    -- Healing Wave, Lesser Healing Wave and Chain Heal, talents included, all exact:
     --   low end  = round(unscaled base x (1 - variance / 2))
-    --   high end = round(unscaled base x (1 + variance / 2)) + 1      (no +1 when there is no variance)
+    --   high end = round(unscaled base x (1 + variance / 2))
     --   both     + per-level step x levels, unrounded
-    -- then the spellpower bonus is added unrounded, talents multiply, and the result is rounded down (F).
+    -- then the spellpower bonus is added unrounded, talents multiply, the result is rounded down (F), and only
+    -- then the high end gets +1 when the spell has variance. (Adding the +1 before talents put Chain Lightning
+    -- and some Lightning Bolt ranks 1 over.)
     local unscaled, var = line.base or 0, line.var or 0
     local levelBonus = c.scaled - unscaled
     local baseLo, baseHi = c.scaled, c.scaled
     if var > 0 then
         baseLo = math.floor(unscaled * (1 - var / 2) + 0.5) + levelBonus
-        baseHi = math.floor(unscaled * (1 + var / 2) + 0.5) + 1 + levelBonus
+        baseHi = math.floor(unscaled * (1 + var / 2) + 0.5) + levelBonus
+        hiPlus = 1
     end
     local bonus = c.bonus
 
