@@ -304,10 +304,11 @@ local function RangedWeaponIsWand()
     return classID == weapon and subclassID == wand
 end
 
--- steps: the spell's weapon effects in effect-index order, applied in that order the way the server does:
--- { add = flat, base = , coeff = } adds the ability's flat amount (its base × the effect's coefficient),
+-- steps: the spell's weapon effects in effect-index order, applied in that order the way classic servers do:
+-- { lo = , hi = , base = , coeff = } adds the ability's flat amount (its base range × the effect's coefficient),
 -- { mul = fraction } multiplies everything so far (weapon percent damage, effect 31: Backstab 150%,
--- Holy Strike 29%). A percent listed after a flat amount therefore multiplies that amount too.
+-- Holy Strike 29%). A percent listed after a flat amount therefore multiplies that amount too, except a
+-- flat amount with { after = true }: it is added on its own after all percents (see AddWeaponDamage).
 local function WeaponLines(steps, normalized, ranged)
     local perDps = ATTACK_POWER_MAGIC_NUMBER
     if not perDps or perDps <= 0 then return nil end   -- the game does not say; show no weapon math
@@ -326,21 +327,37 @@ local function WeaponLines(steps, normalized, ranged)
     if not (lo and hi and speed) or speed <= 0 then return nil end
 
     -- the step rows, and the steps run over a running low/high
+    -- rows in the order the steps apply: the in-order steps first, then the amounts added after
     local function StepRows(out)
+        local function Add(st)
+            local v = st.lo == st.hi and Fmt(st.lo) or (Fmt(st.lo) .. "-" .. Fmt(st.hi))
+            local n
+            if st.coeff ~= 1 then
+                n = (st.lo == st.hi and Fmt(st.base) or (Fmt(st.lo / st.coeff) .. "-" .. Fmt(st.hi / st.coeff)))
+                    .. " × " .. st.coeff .. " effect coefficient" .. (st.after and ", not scaled by weapon percent" or "")
+            end
+            out[#out + 1] = { l = "ability", v = "+ " .. v, n = n }
+        end
         for _, st in ipairs(steps) do
             if st.mul then
                 out[#out + 1] = { l = "weapon percent", v = "× " .. Fmt(st.mul * 100) .. "%" }
-            else
-                out[#out + 1] = { l = "ability", v = "+ " .. Fmt(st.add),
-                                  n = st.coeff ~= 1 and (Fmt(st.base) .. " × " .. st.coeff .. " effect coefficient") or nil }
+            elseif not st.after then
+                Add(st)
             end
         end
-    end
-    local function Run(l, h)
         for _, st in ipairs(steps) do
-            if st.mul then l, h = l * st.mul, h * st.mul else l, h = l + st.add, h + st.add end
+            if st.after then Add(st) end
         end
-        return l, h
+    end
+    -- returns the in-order chain run over l/h, and the after amounts separately
+    local function Run(l, h)
+        local aLo, aHi = 0, 0
+        for _, st in ipairs(steps) do
+            if st.mul then l, h = l * st.mul, h * st.mul
+            elseif st.after then aLo, aHi = aLo + st.lo, aHi + st.hi
+            else l, h = l + st.lo, h + st.hi end
+        end
+        return l, h, aLo, aHi
     end
 
     -- A wand is the whole attack: no attack power and no bonus damage, just the wand's own damage
@@ -352,8 +369,8 @@ local function WeaponLines(steps, normalized, ranged)
             out[1] = { l = "wand", v = Fmt(lo * scale) .. "-" .. Fmt(hi * scale) }
             StepRows(out)
         end
-        local l, h = Run(lo, hi)
-        return out, Fmt(l * scale) .. "-" .. Fmt(h * scale)
+        local l, h, aLo, aHi = Run(lo, hi)
+        return out, Fmt(l * scale + aLo) .. "-" .. Fmt(h * scale + aHi)
     end
 
     local bonus = (posBonus or 0) + (negBonus or 0)
@@ -384,8 +401,8 @@ local function WeaponLines(steps, normalized, ranged)
     StepRows(out)
     if math.abs(pct - 1) >= 0.001 then out[#out + 1] = { l = "damage modifier", v = "× " .. string.format("%.2f", pct) } end
 
-    local totalLo, totalHi = Run(weaponLo + apUsed + bonus, weaponHi + apUsed + bonus)
-    return out, Fmt(totalLo * pct) .. "-" .. Fmt(totalHi * pct)
+    local totalLo, totalHi, aLo, aHi = Run(weaponLo + apUsed + bonus, weaponHi + apUsed + bonus)
+    return out, Fmt(totalLo * pct + aLo) .. "-" .. Fmt(totalHi * pct + aHi)
 end
 
 ---------------------------------------------------------------------
@@ -515,8 +532,18 @@ local function AddWeaponDamage(rows, spellData)
             steps[#steps + 1] = { mul = ScaledBase(spellData, line) / 100 }
             any = true
         elseif t == EFFECT.WEAPON_DAMAGE_NO_SCHOOL or t == EFFECT.WEAPON_DAMAGE or t == EFFECT.NORMALIZED_WEAPON then
+            -- the flat amount's range, by the same rule as spell amounts (see AddSpellDamage)
             local base, coeff = ScaledBase(spellData, line), line.coeff or 1
-            steps[#steps + 1] = { add = base * coeff, base = base, coeff = coeff }
+            local unscaled, var = line.base or 0, line.var or 0
+            local lo, hi = base, base
+            if var > 0 then
+                lo = math.floor(unscaled * (1 - var / 2) + 0.5) + (base - unscaled)
+                hi = math.floor(unscaled * (1 + var / 2) + 0.5) + 1 + (base - unscaled)
+            end
+            -- A coefficient other than 1 marks the flat as its own scaled amount, which the game's tooltip lists
+            -- apart ("29% weapon damage plus an additional 6 to 9 as Holy damage"). A Holy Strike hit of 41
+            -- fit adding it after the weapon percent (32.1-40.4), not under it (27.7-33.8).
+            steps[#steps + 1] = { lo = lo * coeff, hi = hi * coeff, base = base, coeff = coeff, after = coeff ~= 1 }
             if t == EFFECT.NORMALIZED_WEAPON then normalized = true end
             any = true
         end
