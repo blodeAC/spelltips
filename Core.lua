@@ -304,7 +304,11 @@ local function RangedWeaponIsWand()
     return classID == weapon and subclassID == wand
 end
 
-local function WeaponLines(flat, normalized, ranged)
+-- steps: the spell's weapon effects in effect-index order, applied in that order the way the server does:
+-- { add = flat, base = , coeff = } adds the ability's flat amount (its base × the effect's coefficient),
+-- { mul = fraction } multiplies everything so far (weapon percent damage, effect 31: Backstab 150%,
+-- Holy Strike 29%). A percent listed after a flat amount therefore multiplies that amount too.
+local function WeaponLines(steps, normalized, ranged)
     local perDps = ATTACK_POWER_MAGIC_NUMBER
     if not perDps or perDps <= 0 then return nil end   -- the game does not say; show no weapon math
     local lo, hi, speed, posBonus, negBonus, pct, apBase, apPos, apNeg
@@ -321,16 +325,35 @@ local function WeaponLines(flat, normalized, ranged)
     end
     if not (lo and hi and speed) or speed <= 0 then return nil end
 
+    -- the step rows, and the steps run over a running low/high
+    local function StepRows(out)
+        for _, st in ipairs(steps) do
+            if st.mul then
+                out[#out + 1] = { l = "weapon percent", v = "× " .. Fmt(st.mul * 100) .. "%" }
+            else
+                out[#out + 1] = { l = "ability", v = "+ " .. Fmt(st.add),
+                                  n = st.coeff ~= 1 and (Fmt(st.base) .. " × " .. st.coeff .. " effect coefficient") or nil }
+            end
+        end
+    end
+    local function Run(l, h)
+        for _, st in ipairs(steps) do
+            if st.mul then l, h = l * st.mul, h * st.mul else l, h = l + st.add, h + st.add end
+        end
+        return l, h
+    end
+
     -- A wand is the whole attack: no attack power and no bonus damage, just the wand's own damage
     -- (the game reports its range in the ranged-damage call). Checked on the item in the ranged slot.
     if ranged and RangedWeaponIsWand() then
         local scale = pct or 1
-        local out = {}   -- the total is the wand's range; a breakdown row would only repeat it
-        if flat ~= 0 then   -- with a flat amount added, show both parts
+        local out = {}   -- with no steps the total is the wand's range; a breakdown row would only repeat it
+        if #steps > 0 then
             out[1] = { l = "wand", v = Fmt(lo * scale) .. "-" .. Fmt(hi * scale) }
-            out[2] = { l = "ability", v = "+ " .. Fmt(flat) }
+            StepRows(out)
         end
-        return out, Fmt((lo + flat) * scale) .. "-" .. Fmt((hi + flat) * scale)
+        local l, h = Run(lo, hi)
+        return out, Fmt(l * scale) .. "-" .. Fmt(h * scale)
     end
 
     local bonus = (posBonus or 0) + (negBonus or 0)
@@ -351,18 +374,18 @@ local function WeaponLines(flat, normalized, ranged)
     end
 
     local weaponLo, weaponHi = lo - apReal, hi - apReal
+    D("weapon live: UnitDamage", lo, hi, "bonus", posBonus, negBonus, "pct", pct, "speed", speed, "AP", ap, "AP at real speed", apReal)
     local out = {
         { l = "weapon", v = Fmt(weaponLo) .. "-" .. Fmt(weaponHi) },
         { l = "attack power", v = "+ " .. Fmt(apUsed),
           n = Fmt(ap) .. " AP at 1 dmg/sec per " .. perDps .. " AP, × " .. swing },
-        { l = "ability", v = "+ " .. Fmt(flat) },
     }
     if math.abs(bonus) >= 0.05 then out[#out + 1] = { l = "bonus damage", v = "+ " .. Fmt(bonus) } end
+    StepRows(out)
     if math.abs(pct - 1) >= 0.001 then out[#out + 1] = { l = "damage modifier", v = "× " .. string.format("%.2f", pct) } end
 
-    local totalLo = (weaponLo + apUsed + bonus + flat) * pct
-    local totalHi = (weaponHi + apUsed + bonus + flat) * pct
-    return out, Fmt(totalLo) .. "-" .. Fmt(totalHi)
+    local totalLo, totalHi = Run(weaponLo + apUsed + bonus, weaponHi + apUsed + bonus)
+    return out, Fmt(totalLo * pct) .. "-" .. Fmt(totalHi * pct)
 end
 
 ---------------------------------------------------------------------
@@ -481,8 +504,25 @@ local function AddSpellDamage(rows, spellData, line)
     end
 end
 
-local function AddWeaponDamage(rows, spellData, line)
-    local lines, total = WeaponLines(ScaledBase(spellData, line), line.type == EFFECT.NORMALIZED_WEAPON, spellData.ranged)
+-- All of a spell's weapon effects make one Damage row: weapon damage (58, 17), normalized weapon damage (121)
+-- and weapon percent damage (31), in effect order.
+local function AddWeaponDamage(rows, spellData)
+    local steps, normalized, any = {}, false, false
+    for _, idx in ipairs(SortedKeys(spellData.lines)) do
+        local line = spellData.lines[idx]
+        local t = line.type
+        if t == EFFECT.WEAPON_PERCENT then
+            steps[#steps + 1] = { mul = ScaledBase(spellData, line) / 100 }
+            any = true
+        elseif t == EFFECT.WEAPON_DAMAGE_NO_SCHOOL or t == EFFECT.WEAPON_DAMAGE or t == EFFECT.NORMALIZED_WEAPON then
+            local base, coeff = ScaledBase(spellData, line), line.coeff or 1
+            steps[#steps + 1] = { add = base * coeff, base = base, coeff = coeff }
+            if t == EFFECT.NORMALIZED_WEAPON then normalized = true end
+            any = true
+        end
+    end
+    if not any then return end
+    local lines, total = WeaponLines(steps, normalized, spellData.ranged)
     if not lines then return end
     local row = GetRow(rows, "Damage")
     row.suffix = "(before armor)"
@@ -526,10 +566,6 @@ local function AddOwnLines(rows, spellData, spellID)
         D("auto-attack check: client has neither IsAutoAttackSpell nor IsAttackSpell")
         return false
     end
-    local hasPercentRow = false
-    for _, line in pairs(spellData.lines) do
-        if line.type == EFFECT.WEAPON_PERCENT then hasPercentRow = true end
-    end
     -- a spell-power damage or heal effect (direct or periodic) of spell sd: true when it was added
     local function SpellAmount(sd, line)
         local t = line.type
@@ -543,15 +579,9 @@ local function AddOwnLines(rows, spellData, spellID)
     end
 
     for _, idx in ipairs(SortedKeys(spellData.lines)) do
-        local line = spellData.lines[idx]
-        local t = line.type
-        if SpellAmount(spellData, line) then
-            -- added
-        elseif (t == EFFECT.WEAPON_DAMAGE_NO_SCHOOL or t == EFFECT.WEAPON_DAMAGE or t == EFFECT.NORMALIZED_WEAPON)
-            and not (t == EFFECT.NORMALIZED_WEAPON and hasPercentRow) then
-            AddWeaponDamage(rows, spellData, line)
-        end
+        SpellAmount(spellData, spellData.lines[idx])
     end
+    AddWeaponDamage(rows, spellData)
     -- Amounts that live in another spell, named by this spell's own description token ($26367s1 in Lightning
     -- Shield's text): the generator wrote them as shows = {{ id, idx }}. The math uses that spell's own entry
     -- (base, coefficient, level range, talents).
@@ -561,7 +591,7 @@ local function AddOwnLines(rows, spellData, spellID)
         if line then SpellAmount(sd, line) end
     end
     if next(spellData.lines) == nil and not rows.Damage and IsMeleeAutoAttack(spellID) then
-        local lines, total = WeaponLines(0, false, false)   -- the plain weapon swing, no ability bonus
+        local lines, total = WeaponLines({}, false, false)   -- the plain weapon swing, no ability bonus
         if lines then
             local row = GetRow(rows, "Damage")
             row.suffix = "(before armor)"
