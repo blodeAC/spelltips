@@ -28,8 +28,6 @@ local COLOR = {
     dim        = "666666",
     sel        = "ffd100",  -- the talent selected with Alt+wheel
     selNote    = "c8a840",
-    heal       = "ffd100",  -- text of the heal labels
-    healFill   = "66ff99",  -- the heal's reach drawn on the health bar
 }
 
 -- Game ids the rules below key on. Spell effect types and aura types are numbers in the game files with
@@ -1596,6 +1594,7 @@ local function LoadSettings()
         if SpellTipsDB[key] == nil then SpellTipsDB[key] = value end
     end
     SpellTipsDB.colors = type(SpellTipsDB.colors) == "table" and SpellTipsDB.colors or {}
+    SpellTipsDB.heal = nil  -- settings of the removed heal-label test
     db = SpellTipsDB
     ApplySettings()
 end
@@ -1650,34 +1649,6 @@ local function NewButton(parent, text, width, onClick)
     b:SetText(text)
     b:SetScript("OnClick", onClick)
     return b
-end
-
--- A label and a button that steps through options = { { value, shown text }, ... }
--- (left click: next, right click: previous). Returns a function that redraws the button text.
-local function CycleRow(parent, y, label, options, get, set, afterChange)
-    local text = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    text:SetPoint("TOPLEFT", 24, y - 5)
-    text:SetText(label)
-    local button
-    local function refresh()
-        for _, o in ipairs(options()) do
-            if o[1] == get() then button:SetText(o[2]) return end
-        end
-    end
-    button = NewButton(parent, "", 170, function(_, mouse)
-        local list, index = options(), 1
-        for i, o in ipairs(list) do
-            if o[1] == get() then index = i break end
-        end
-        index = (mouse == "RightButton") and ((index - 2) % #list + 1) or (index % #list + 1)
-        set(list[index][1])
-        ApplySettings()
-        if afterChange then afterChange() end
-    end)
-    button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-    button:SetPoint("TOPRIGHT", -24, y)
-    refresh()
-    return refresh
 end
 
 local function KeyOptions(exclude)
@@ -1736,7 +1707,7 @@ end
 ---------------------------------------------------------------------
 -- Settings window
 ---------------------------------------------------------------------
-local settingsWindow
+local optionsPage, optionsCategory  -- the SpellTips page in the game's Options window
 local ShowReport
 
 -- Spells to preview: the ones on the action bars that have talent data, most talents first
@@ -1797,8 +1768,12 @@ local function DrawPreview()
         preview.asked[preview.spell] = true
         C_Spell.RequestLoadSpellData(preview.spell)
     end
+    local docked = optionsPage and optionsPage.PlacePreview
     local function set()
-        if GameTooltip_SetDefaultAnchor then  -- where this player's tooltips normally appear
+        if docked then  -- inside the SpellTips Options page, where it can't cover the settings
+            tooltip:SetOwner(optionsPage, "ANCHOR_NONE")
+            optionsPage.PlacePreview(tooltip, false)
+        elseif GameTooltip_SetDefaultAnchor then  -- where this player's tooltips normally appear
             GameTooltip_SetDefaultAnchor(tooltip, UIParent)
         else
             tooltip:SetOwner(UIParent, "ANCHOR_NONE")
@@ -1818,83 +1793,392 @@ local function DrawPreview()
     S.selID = S.order[#S.order]  -- the last one listed is a locked talent when there is one, which shows both selection colors
     if S.selID then set() end
     S.selID = nil  -- the choice is only for the picture; a real tooltip must not inherit it
+    if docked then optionsPage.PlacePreview(tooltip, true) end  -- now that its size is known, make room for it
 end
 
 function RefreshPreview()
-    if settingsWindow and settingsWindow:IsShown() then DrawPreview() end
+    if optionsPage and optionsPage:IsVisible() then DrawPreview() end
+end
+
+-- The SpellTips page in the game's Options window (Options > AddOns > SpellTips). Nothing has a fixed width or a fixed
+-- y step: the page is a scroll frame whose content is as wide as the space the Options window gives it, every row is
+-- pinned at both edges, text wraps, each row's height is measured from what it shows, and buttons are as wide as
+-- their (widest) text. layout() runs on show and once more a frame later, when wrapped text knows its height.
+-- The preview tooltip docks at the page's top right and the rows are narrowed by its measured width (labels wrap to
+-- what is left). It always goes beside the rows: a preview is usually taller than the page, and below the rows the
+-- game's clamp-to-screen pushed it back up over them.
+local function BuildOptionsPage()
+    local MARGIN, GAP, PAD, SWATCH = 16, 10, 32, 22   -- PAD: a button's end caps; SWATCH: a color button's size
+    local page = NewFrame("Frame", nil, UIParent)
+    local scroll = CreateFrame("ScrollFrame", nil, page, "UIPanelScrollFrameTemplate")
+    scroll:SetPoint("TOPLEFT", 0, -4)
+    -- the template hangs its scroll bar 6px outside the frame's right edge
+    scroll:SetPoint("BOTTOMRIGHT", -(scroll.ScrollBar:GetWidth() + 6 + 4), 4)
+    local content = CreateFrame("Frame", nil, scroll)
+    content:SetSize(1, 1)
+    scroll:SetScrollChild(content)
+
+    -- "there's more": the page's bottom edge fades out with a "Scroll for more" note while content continues below,
+    -- the top edge fades once you've scrolled down, and the scroll bar only shows when there is something to scroll.
+    -- Driven by the scroll frame's own events (range changed, scrolled); the fades sit on a frame above the rows.
+    local edges = CreateFrame("Frame", nil, page)
+    edges:SetAllPoints(scroll)
+    edges:SetFrameLevel(scroll:GetFrameLevel() + 10)
+    local moreText = edges:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    moreText:SetPoint("BOTTOM", edges, "BOTTOM", 0, 2)
+    moreText:SetText("Scroll for more")
+    local function Fade(point, dark)  -- a strip along one edge, opaque at the edge, clear toward the middle
+        local t = edges:CreateTexture(nil, "ARTWORK")
+        t:SetPoint(point .. "LEFT", edges, point .. "LEFT", 0, 0)
+        t:SetPoint(point .. "RIGHT", edges, point .. "RIGHT", 0, 0)
+        local _, fontSize = moreText:GetFont()
+        t:SetHeight(math.ceil(fontSize or 10) * 3)  -- three lines of the note's font
+        t:SetColorTexture(1, 1, 1, 1)
+        local opaque, clear = CreateColor(0, 0, 0, dark), CreateColor(0, 0, 0, 0)
+        if point == "BOTTOM" then t:SetGradient("VERTICAL", opaque, clear) else t:SetGradient("VERTICAL", clear, opaque) end
+        return t
+    end
+    local fadeBottom, fadeTop = Fade("BOTTOM", 0.9), Fade("TOP", 0.9)
+    local function UpdateEdges()
+        local range, at = scroll:GetVerticalScrollRange() or 0, scroll:GetVerticalScroll() or 0
+        local below, above = at < range - 1, at > 1
+        fadeBottom:SetShown(below)
+        moreText:SetShown(below)
+        fadeTop:SetShown(above)
+        scroll.ScrollBar:SetShown(range > 1)
+    end
+    scroll:HookScript("OnScrollRangeChanged", UpdateEdges)
+    scroll:HookScript("OnVerticalScroll", UpdateEdges)
+
+    local refreshers, layout = {}, nil
+    local function refreshAll()
+        for _, fn in ipairs(refreshers) do fn() end
+        if layout then layout() end
+    end
+
+    local rows = {}
+    local rightInset = 0  -- room kept free on the right for the docked preview
+    local function AnchorRow(i)
+        local row, prev = rows[i], rows[i - 1]
+        row:ClearAllPoints()
+        if prev then
+            row:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -row.gap)
+        else
+            row:SetPoint("TOPLEFT", content, "TOPLEFT", MARGIN, -MARGIN)
+        end
+        row:SetPoint("RIGHT", content, "RIGHT", -(MARGIN + rightInset), 0)
+    end
+    local function AddRow(gapBefore)
+        local row = CreateFrame("Frame", nil, content)
+        row.gap = gapBefore or GAP
+        rows[#rows + 1] = row
+        AnchorRow(#rows)
+        return row
+    end
+
+    local function AddText(text, font, justify, gapBefore)
+        local row = AddRow(gapBefore)
+        local fs = row:CreateFontString(nil, "OVERLAY", font)
+        fs:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+        fs:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+        fs:SetJustifyH(justify or "LEFT")
+        fs:SetText(text)
+        row.measure = function() return fs:GetStringHeight() end
+        return fs
+    end
+
+    local function FitButton(b) b:SetWidth(math.ceil(b:GetFontString():GetStringWidth()) + PAD) end
+
+    -- a label (wraps) on the left, a button on the right stepping through { { value, shown text }, ... }
+    -- (left click: next, right click: previous); the button is as wide as its widest choice
+    local function AddCycle(label, options, get, set, afterChange)
+        local row = AddRow()
+        local button
+        local function refresh()
+            for _, o in ipairs(options()) do
+                if o[1] == get() then button:SetText(o[2]) return end
+            end
+        end
+        button = NewButton(row, "", 1, function(_, mouse)
+            local list, index = options(), 1
+            for i, o in ipairs(list) do
+                if o[1] == get() then index = i break end
+            end
+            index = (mouse == "RightButton") and ((index - 2) % #list + 1) or (index % #list + 1)
+            set(list[index][1])
+            ApplySettings()
+            if afterChange then afterChange() end
+        end)
+        button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        button:SetPoint("TOPRIGHT", row, "TOPRIGHT", 0, 0)
+        local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        text:SetPoint("LEFT", row, "LEFT", 0, 0)
+        text:SetPoint("RIGHT", button, "LEFT", -GAP, 0)
+        text:SetJustifyH("LEFT")
+        text:SetText(label)
+        refreshers[#refreshers + 1] = function()
+            local fs, widest = button:GetFontString(), 0
+            for _, o in ipairs(options()) do
+                button:SetText(o[2])
+                widest = math.max(widest, fs:GetStringWidth())
+            end
+            button:SetWidth(math.ceil(widest) + PAD)
+            refresh()
+        end
+        row.measure = function() return math.max(button:GetHeight(), text:GetStringHeight()) end
+    end
+
+    AddText("Hold a key over a spell to see the numbers behind it. Type /spelltips any time to come back here.",
+        "GameFontHighlight")
+
+    AddCycle("Key that shows talents", function() return KeyOptions() end,
+        function() return db.holdKey end, function(v) db.holdKey = v end, refreshAll)
+    AddCycle("Key that adds locked talents", function() return KeyOptions(db.holdKey) end,
+        function() return db.moreKey end, function(v) db.moreKey = v end, refreshAll)
+    AddCycle("Shown with no key held", function() return LEVEL_OPTIONS end,
+        function() return db.alwaysLevel end, function(v) db.alwaysLevel = v end, refreshAll)
+    AddCycle("Preview spell",
+        function()
+            local list = {}
+            for _, c in ipairs(previewCandidates or {}) do list[#list + 1] = { c.id, c.name } end
+            if #list == 0 then list[1] = { false, "none found" } end
+            return list
+        end,
+        function() return preview.spell or false end,
+        function(v) preview.spell = v or nil end, function() refreshAll() DrawPreview() end)
+
+    AddText("Colors   (click to change, right-click to reset one; hover one to outline where it's used)", "GameFontNormal", "LEFT", 2 * GAP)
+
+    -- Hovering a color outlines where the preview uses it, without changing any color (so the colors can still be
+    -- judged). The spots are found once per preview, not per hover: the preview is drawn once with every color swapped
+    -- for its own marker (several settings share the same gray by default, so only a swap tells them apart), each
+    -- marker's lines are noted, and the preview is drawn again in the real colors. A hover then only moves outlines.
+    -- The finding pass runs a frame after the preview changes, once however many changes came in that frame.
+    local marking            -- the color key under the mouse
+    local hitsByKey = {}     -- key -> { "TextLeft3", "TextRight7", ... } for the preview as drawn now
+    local finding, findQueued = false, false
+    local boxes = {}
+    local function Outline(tip)
+        local box = CreateFrame("Frame", nil, tip)
+        -- { from, to, horizontal }: top, bottom, left, right
+        for _, edge in ipairs({ { "TOPLEFT", "TOPRIGHT", true }, { "BOTTOMLEFT", "BOTTOMRIGHT", true },
+                                { "TOPLEFT", "BOTTOMLEFT", false }, { "TOPRIGHT", "BOTTOMRIGHT", false } }) do
+            local t = box:CreateTexture(nil, "OVERLAY")
+            t:SetColorTexture(1, 0, 1, 1)
+            t:SetPoint(edge[1], box, edge[1], 0, 0)
+            t:SetPoint(edge[2], box, edge[2], 0, 0)
+            if edge[3] then t:SetHeight(1) else t:SetWidth(1) end
+        end
+        return box
+    end
+    local function MarkPreview()
+        for _, box in ipairs(boxes) do box:Hide() end
+        local tip = preview.tooltip
+        local hits = marking and hitsByKey[marking]
+        if not (hits and tip and tip:IsShown()) then return end
+        local name = tip:GetName()
+        for n, hit in ipairs(hits) do
+            local fs = _G[name .. hit]
+            if fs and fs:IsShown() then
+                local box = boxes[n] or Outline(tip)
+                boxes[n] = box
+                box:ClearAllPoints()
+                box:SetPoint("TOPLEFT", fs, "TOPLEFT", -2, 2)
+                box:SetPoint("BOTTOMRIGHT", fs, "BOTTOMRIGHT", 2, -2)
+                box:Show()
+            end
+        end
+    end
+    local function FindAll()
+        findQueued = false
+        local tip = preview.tooltip
+        if not (page:IsVisible() and tip and preview.spell) then return end
+        local used, markers, n = {}, {}, 0
+        for _, hex in pairs(COLOR) do used[hex:lower()] = true end
+        for _, entry in ipairs(COLOR_LABELS) do
+            local hex
+            repeat
+                n = n + 1
+                hex = string.format("fe%04x", n)
+            until not used[hex]
+            markers[entry[1]] = hex
+        end
+        finding = true
+        for key, hex in pairs(markers) do COLOR[key] = hex end
+        DrawPreview()  -- the finding pass
+        local found, name = {}, tip:GetName()
+        for i = 1, tip:NumLines() do
+            for _, side in ipairs({ "TextLeft", "TextRight" }) do
+                local fs = _G[name .. side .. i]
+                local text = fs and fs:IsShown() and fs:GetText()
+                if type(text) == "string" and not (issecretvalue and issecretvalue(text)) then
+                    text = text:lower()
+                    for key, hex in pairs(markers) do
+                        if text:find("|cff" .. hex, 1, true) then
+                            found[key] = found[key] or {}
+                            found[key][#found[key] + 1] = side .. i
+                        end
+                    end
+                end
+            end
+        end
+        ApplyColors()
+        DrawPreview()  -- the real colors
+        finding = false
+        hitsByKey = found
+        MarkPreview()
+    end
+    -- called after every preview draw
+    page.MarkPreview = function()
+        if not finding then
+            hitsByKey = {}
+            if not findQueued then
+                findQueued = true
+                C_Timer.After(0, FindAll)
+            end
+        end
+        MarkPreview()
+    end
+    local function Mark(key)
+        marking = key
+        MarkPreview()
+    end
+    page.Unmark = function() Mark(nil) end
+
+    for _, entry in ipairs(COLOR_LABELS) do
+        local key, label = entry[1], entry[2]
+        local row = AddRow(GAP / 2)
+        local swatch = NewButton(row, "", SWATCH, nil)
+        swatch:SetSize(SWATCH, SWATCH)
+        swatch:SetPoint("LEFT", row, "LEFT", 0, 0)
+        swatch.texture = swatch:CreateTexture(nil, "OVERLAY")
+        swatch.texture:SetPoint("TOPLEFT", 4, -4)
+        swatch.texture:SetPoint("BOTTOMRIGHT", -4, 4)
+        local function paint() swatch.texture:SetColorTexture(HexToRGB(COLOR[key])) end
+        refreshers[#refreshers + 1] = paint
+        swatch:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        swatch:SetScript("OnClick", function(_, mouse)
+            if mouse == "RightButton" then
+                db.colors[key] = nil
+                ApplyColors()
+                paint()
+                RefreshOpenTooltip()
+                DrawPreview()
+            else
+                PickColor(key, function() paint() DrawPreview() end)
+            end
+        end)
+        local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        text:SetPoint("LEFT", swatch, "RIGHT", 8, 0)
+        text:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+        text:SetJustifyH("LEFT")
+        text:SetText(label)
+        row.measure = function() return math.max(SWATCH, text:GetStringHeight()) end
+        local function enter() Mark(key) end
+        local function leave() if not row:IsMouseOver() then Mark(nil) end end  -- moving onto the swatch is still inside the row
+        row:EnableMouse(true)
+        row:SetScript("OnEnter", enter)
+        row:SetScript("OnLeave", leave)
+        swatch:HookScript("OnEnter", enter)
+        swatch:HookScript("OnLeave", leave)
+    end
+
+    AddText("Wheel through talents with the first key held. Right-click a button to go back.",
+        "GameFontDisableSmall", "LEFT", 2 * GAP)
+
+    local resetRow = AddRow(GAP)
+    local resetButton = NewButton(resetRow, "Reset all", 1, function() ResetSettings() refreshAll() DrawPreview() end)
+    resetButton:SetPoint("TOPLEFT", resetRow, "TOPLEFT", 0, 0)
+    FitButton(resetButton)
+    resetRow.measure = function() return resetButton:GetHeight() end
+
+    local previewTip, scaledFor  -- scaledFor: the spell the preview's current scale was worked out for
+    local function AnchorPreview()
+        if not previewTip then return end
+        previewTip:ClearAllPoints()
+        previewTip:SetPoint("TOPRIGHT", scroll, "TOPRIGHT", -MARGIN, -MARGIN)  -- fixed to the visible page, not the scrolling rows
+    end
+
+    -- rescale: measure the preview again and resize it. Right after a redraw the tooltip has not finished sizing itself,
+    -- so that pass keeps the current scale; the tooltip's own OnSizeChanged rescales once its size is final.
+    layout = function(rescale)
+        rightInset = 0
+        if previewTip and previewTip:IsShown() then
+            -- Shrink a preview taller than the page so it ends inside it. A tooltip re-wraps its text when its scale
+            -- changes, so its height moves with every new scale; letting the scale go back up chased that and stretched
+            -- it. So for one spell the scale only ever goes down: it settles, and never grows over the Close button.
+            -- Heights are compared in screen units: the tooltip hangs off UIParent, the page has the Options window's scale.
+            local base = previewTip:GetEffectiveScale() / previewTip:GetScale()  -- its scale without its own SetScale
+            local scale = previewTip:GetScale()
+            if rescale ~= false then
+                local roomPx = (scroll:GetHeight() - 2 * MARGIN) * scroll:GetEffectiveScale()
+                local tipPx = previewTip:GetHeight() * base
+                local fit = (tipPx > 0 and roomPx > 0) and math.min(1, roomPx / tipPx) or 1
+                if scaledFor == preview.spell then
+                    scale = math.min(scale, fit)
+                else
+                    scale, scaledFor = fit, preview.spell
+                end
+                previewTip:SetScale(scale)
+            end
+            -- the room the rows leave for it, in the page's own units
+            rightInset = math.ceil(previewTip:GetWidth() * base * scale / content:GetEffectiveScale()) + 2 * GAP
+        end
+        for i = 1, #rows do AnchorRow(i) end
+        local total = MARGIN
+        for i, row in ipairs(rows) do
+            local h = math.max(1, math.ceil(row.measure() or 0))
+            row:SetHeight(h)
+            total = total + h + (i > 1 and row.gap or 0)
+        end
+        content:SetHeight(total + MARGIN)
+        AnchorPreview()
+    end
+    -- DrawPreview hands the tooltip over before drawing (anchor only) and after (size known: lay out again)
+    page.PlacePreview = function(tooltip, measured)
+        previewTip = tooltip
+        if not tooltip.stSizeHook then  -- the tooltip says when it has finished sizing itself
+            tooltip.stSizeHook = true
+            tooltip:HookScript("OnSizeChanged", function() if page:IsVisible() then layout() end end)
+        end
+        if measured then
+            if page.MarkPreview then page.MarkPreview() end
+            layout(false)
+        else
+            AnchorPreview()
+        end
+    end
+    scroll:SetScript("OnSizeChanged", function(_, w)
+        content:SetWidth(w)
+        layout()
+    end)
+    page:SetScript("OnShow", function()
+        scaledFor = nil  -- the Options window may have a new size: work the scale out afresh
+        previewCandidates = PreviewCandidates()
+        local listed = false
+        for _, c in ipairs(previewCandidates) do if c.id == preview.spell then listed = true end end
+        if not listed then preview.spell = previewCandidates[1] and previewCandidates[1].id end
+        content:SetWidth(scroll:GetWidth())
+        refreshAll()
+        DrawPreview()
+        -- wrapped text reports its final height only after it has been drawn at its width
+        C_Timer.After(0, layout)
+        UpdateEdges()
+    end)
+    page:SetScript("OnHide", function()
+        page.Unmark()
+        if preview.tooltip then preview.tooltip:Hide() end
+    end)
+    page.OnDefault = function() ResetSettings() refreshAll() end  -- the Options window's Defaults button
+    return page
 end
 
 local function ShowSettings()
-    if not settingsWindow then
-        local w = NewPanel("SpellTipsSettings", 480, 490, "SpellTips")
-        settingsWindow = w
-        w:ClearAllPoints()
-        w:SetPoint("CENTER", UIParent, "CENTER", -300, 40)  -- tooltips normally appear low on the right, so stay clear of them
-        w:SetScript("OnHide", function() if preview.tooltip then preview.tooltip:Hide() end end)
-        local refreshers = {}
-        local function refreshAll() for _, fn in ipairs(refreshers) do fn() end end
-
-        refreshers[#refreshers + 1] = CycleRow(w, -56, "Key that shows talents", function() return KeyOptions() end,
-            function() return db.holdKey end, function(v) db.holdKey = v end, refreshAll)
-        refreshers[#refreshers + 1] = CycleRow(w, -90, "Key that adds locked talents", function() return KeyOptions(db.holdKey) end,
-            function() return db.moreKey end, function(v) db.moreKey = v end, refreshAll)
-        refreshers[#refreshers + 1] = CycleRow(w, -124, "Shown with no key held", function() return LEVEL_OPTIONS end,
-            function() return db.alwaysLevel end, function(v) db.alwaysLevel = v end, refreshAll)
-
-        previewCandidates = PreviewCandidates()
-        preview.spell = previewCandidates[1] and previewCandidates[1].id
-        refreshers[#refreshers + 1] = CycleRow(w, -158, "Preview spell",
-            function()
-                local list = {}
-                for _, c in ipairs(previewCandidates) do list[#list + 1] = { c.id, c.name } end
-                if #list == 0 then list[1] = { false, "none found" } end
-                return list
-            end,
-            function() return preview.spell or false end,
-            function(v) preview.spell = v or nil end, refreshAll)
-
-        local colorsTitle = w:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        colorsTitle:SetPoint("TOPLEFT", 24, -206)
-        colorsTitle:SetText("Colors   (click to change, right-click to reset one)")
-
-        for i, entry in ipairs(COLOR_LABELS) do
-            local key, label = entry[1], entry[2]
-            local column, row = (i - 1) % 2, math.floor((i - 1) / 2)
-            local swatch = NewButton(w, "", 22, nil)
-            swatch:SetSize(22, 22)
-            swatch:SetPoint("TOPLEFT", 24 + column * 220, -232 - row * 28)
-            swatch.texture = swatch:CreateTexture(nil, "OVERLAY")
-            swatch.texture:SetPoint("TOPLEFT", 4, -4)
-            swatch.texture:SetPoint("BOTTOMRIGHT", -4, 4)
-            local function paint() swatch.texture:SetColorTexture(HexToRGB(COLOR[key])) end
-            paint()
-            refreshers[#refreshers + 1] = paint
-            swatch:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-            swatch:SetScript("OnClick", function(_, mouse)
-                if mouse == "RightButton" then
-                    db.colors[key] = nil
-                    ApplyColors()
-                    paint()
-                    RefreshOpenTooltip()
-                else
-                    PickColor(key, paint)
-                end
-            end)
-            local text = w:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-            text:SetPoint("LEFT", swatch, "RIGHT", 8, 0)
-            text:SetText(label)
-        end
-
-        NewButton(w, "Reset all", 100, function() ResetSettings() refreshAll() end):SetPoint("BOTTOMLEFT", 24, 20)
-        NewButton(w, "Heal labels...", 130, function() if S.ShowHealSettings then S.ShowHealSettings() end end):SetPoint("BOTTOMRIGHT", -24, 20)
-        local note = w:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-        note:SetPoint("BOTTOM", 0, 52)
-        note:SetText("Wheel through talents with the first key held. Right-click a button to go back.")
-        w.refreshAll = refreshAll
+    if optionsCategory and Settings and Settings.OpenToCategory then
+        Settings.OpenToCategory(optionsCategory:GetID())
+    else
+        print("[spelltips] this client has no Options page for addons")
     end
-    settingsWindow.refreshAll()
-    settingsWindow:Show()
-    DrawPreview()
 end
 
 ---------------------------------------------------------------------
@@ -1905,7 +2189,7 @@ local ICON = "Interface\\Icons\\INV_Misc_Book_09"
 local minimapButton
 
 local function ToggleSettings()
-    if settingsWindow and settingsWindow:IsShown() then settingsWindow:Hide() else ShowSettings() end
+    ShowSettings()  -- closing the Blizzard Options window from addon code taints the Game Menu it returns to
 end
 
 local function PlaceMinimapButton()
@@ -2178,1119 +2462,6 @@ local function ProbeListing(filter)
     return table.concat(out, "\n")
 end
 
--- /spelltips pick <missing HP> <spell name>: which known rank of a spell covers that much missing health with
--- the least waste, using the predicted heal of each rank (spell power and the downrank penalty included).
--- The missing-HP number is typed in, so this works on a dummy and out of combat.
-local function PickListing(arg)
-    local missingText, name = (arg or ""):match("^%s*(%d+)%s+(.-)%s*$")
-    local missing = tonumber(missingText)
-    if not missing or name == "" then return "Usage: /spelltips pick 375 Healing Touch" end
-    local ids, message = RanksOfSpell(name)
-    if not ids then return message end
-
-    local function plain(v) return type(v) == "number" and not (issecretvalue and issecretvalue(v)) and v or nil end
-    local rows = {}
-    for _, id in ipairs(ids) do
-        local sd = Data.AddonData[id]
-        local okKnown, known = pcall(function() return IsSpellKnown == nil or IsSpellKnown(id) end)
-        local line
-        for _, k in ipairs(SortedKeys(sd.lines)) do
-            local l = sd.lines[k]
-            if l.type == EFFECT.HEAL and (l.coeff or 0) > 0 then line = l break end
-        end
-        if line and okKnown and known then
-            local c = PredictRange(sd, line)
-            local okRank, rank = pcall(function() return (C_Spell.GetSpellSubtext or GetSpellSubtext)(id) end)
-            local okCost, cost = pcall(function() return (C_Spell.GetSpellPowerCost(id) or {})[1] end)
-            local okInfo, info = pcall(C_Spell.GetSpellInfo, id)
-            rows[#rows + 1] = {
-                id = id, rank = okRank and tostring(rank) or "?", factor = c.factor,
-                lo = c.scaled - c.half + c.bonus, hi = c.scaled + c.half + c.bonus,
-                avg = c.scaled + c.bonus,
-                cost = okCost and cost and plain(cost.cost), cast = okInfo and info and plain(info.castTime),
-            }
-        end
-    end
-    if #rows == 0 then return "No known healing ranks of '" .. name .. "' found." end
-
-    local pick
-    for _, r in ipairs(rows) do
-        if r.avg >= missing then pick = r break end
-    end
-    pick = pick or rows[#rows]
-
-    local out = { string.format("missing %d HP, %s, level %d, healing power %s", missing, name, UnitLevel("player") or 0,
-        tostring(ReadLive("healing", GetSpellBonusHealing))) }
-    for _, r in ipairs(rows) do
-        out[#out + 1] = string.format("%s %-8s %6.0f - %-6.0f avg %6.0f  penalty x%.2f  cost %s  cast %s sec  %s%s",
-            r == pick and "->" or "  ", r.rank, r.lo, r.hi, r.avg, r.factor, tostring(r.cost or "?"),
-            r.cast and string.format("%.1f", r.cast / 1000) or "?",
-            r.avg >= missing and string.format("overheal %.0f", r.avg - missing) or string.format("short by %.0f", missing - r.avg),
-            r == pick and (pick.avg >= missing and "   <- lowest rank that covers it" or "   <- nothing covers it, strongest") or "")
-    end
-    return table.concat(out, "\n")
-end
-
--- /spelltips secrets: what an addon can read about health right now. In combat the client may hand back
--- "secret" numbers that cannot be compared. Run it mid-fight to capture, then /spelltips secrets show.
-local function SecretKind(v)
-    if v == nil then return "nil" end
-    if issecretvalue and issecretvalue(v) then return "SECRET" end
-    return "readable " .. tostring(v)
-end
-
-local function TryRead(fn, ...)
-    if not fn then return "(no such function)" end
-    local ok, v = pcall(fn, ...)
-    if not ok then return "error" end
-    return SecretKind(v)
-end
-
-local function SecretsSnapshot()
-    local out = {}
-    local function add(text) out[#out + 1] = text end
-    local version, build = GetBuildInfo()
-    add(string.format("health readability  client %s build %s  in combat: %s  issecretvalue exists: %s",
-        tostring(version), tostring(build), tostring(InCombatLockdown()), tostring(issecretvalue ~= nil)))
-
-    local secretFns = {}
-    if C_Secrets then
-        for k, v in pairs(C_Secrets) do
-            if type(v) == "function" then secretFns[#secretFns + 1] = k end
-        end
-        table.sort(secretFns)
-        add("C_Secrets functions: " .. table.concat(secretFns, ", "))
-    else
-        add("C_Secrets: not present")
-    end
-    add("own stats: healing power " .. TryRead(GetSpellBonusHealing) .. ", level " .. TryRead(UnitLevel, "player"))
-    add("")
-
-    local units = { "player", "target", "targettarget", "mouseover", "focus", "party1", "party2", "party3", "party4", "raid1", "raid2" }
-    if C_NamePlate and C_NamePlate.GetNamePlates then
-        local ok, plates = pcall(C_NamePlate.GetNamePlates)
-        for i = 1, ok and type(plates) == "table" and math.min(#plates, 4) or 0 do
-            local token = plates[i].namePlateUnitToken
-            if token then units[#units + 1] = token end
-        end
-    end
-    local shown = 0
-    for _, unit in ipairs(units) do
-        local okExists, exists = pcall(UnitExists, unit)
-        if okExists and exists and not (issecretvalue and issecretvalue(exists)) then
-            shown = shown + 1
-            add(unit .. ":")
-            add("  UnitHealth " .. TryRead(UnitHealth, unit) .. " | UnitHealthMax " .. TryRead(UnitHealthMax, unit)
-                .. " | UnitHealthMissing " .. TryRead(UnitHealthMissing, unit)
-                .. " | UnitHealthPercent " .. TryRead(UnitHealthPercent, unit)
-                .. " | incoming heals " .. TryRead(UnitGetIncomingHeals, unit))
-            add("  friend " .. TryRead(UnitIsFriend, "player", unit) .. " | name " .. TryRead(UnitName, unit)
-                .. " | level " .. TryRead(UnitLevel, unit))
-            for _, fnName in ipairs(secretFns) do
-                if fnName:find("Health") then add("  C_Secrets." .. fnName .. " " .. TryRead(C_Secrets[fnName], unit)) end
-            end
-        end
-    end
-    if shown == 0 then add("no units to read: target something and run it again") end
-    return table.concat(out, "\n")
-end
-
--- /spelltips curve: can a secret health number still drive a display? Checks which curve helpers exist,
--- builds a step curve, feeds a secret percent through it, and tries to hand the secret results to widgets.
--- Every step is reported on its own, so a failure shows exactly where the path stops.
-local function CurveProbe()
-    local out = {}
-    local function add(text) out[#out + 1] = text end
-    local function names(t)
-        local list = {}
-        for k, v in pairs(t) do list[#list + 1] = tostring(k) .. (type(v) == "number" and ("=" .. v) or "") end
-        table.sort(list)
-        return table.concat(list, ", ")
-    end
-    local function step(label, fn, ...)
-        local ok, a, b = pcall(fn, ...)
-        if not ok then add("  " .. label .. ": error: " .. tostring(a)) return nil end
-        add("  " .. label .. ": ok, " .. SecretKind(a))
-        return a, b
-    end
-
-    local version, build = GetBuildInfo()
-    add(string.format("curve probe  client %s build %s  in combat: %s", tostring(version), tostring(build), tostring(InCombatLockdown())))
-    add("C_CurveUtil: " .. (C_CurveUtil and names(C_CurveUtil) or "not present"))
-    add("CurveConstants: " .. (CurveConstants and names(CurveConstants) or "not present"))
-    add("Enum.LuaCurveType: " .. (Enum and Enum.LuaCurveType and names(Enum.LuaCurveType) or "not present"))
-    add("Enum.UnitHealthPercentCurve / related: " .. (Enum and (function()
-        local list = {}
-        for k in pairs(Enum) do if tostring(k):find("Curve") or tostring(k):find("Secret") then list[#list + 1] = tostring(k) end end
-        table.sort(list)
-        return #list > 0 and table.concat(list, ", ") or "none"
-    end)() or "no Enum"))
-    add("")
-
-    -- a step curve over health percent (0..1): three bands
-    local curve
-    if C_CurveUtil and C_CurveUtil.CreateCurve then
-        local okC, c = pcall(C_CurveUtil.CreateCurve)
-        if okC and c then
-            curve = c
-            add("curve object created; methods: " .. (type(getmetatable(c)) == "table" and type(getmetatable(c).__index) == "table"
-                and names(getmetatable(c).__index) or "(unknown)"))
-            if Enum and Enum.LuaCurveType and Enum.LuaCurveType.Step and c.SetType then pcall(c.SetType, c, Enum.LuaCurveType.Step) end
-            if c.AddPoint then
-                pcall(c.AddPoint, c, 0, 0)
-                pcall(c.AddPoint, c, 0.33, 1)
-                pcall(c.AddPoint, c, 0.66, 2)
-            end
-        else
-            add("curve creation failed: " .. tostring(c))
-        end
-    end
-    add("")
-
-    for _, unit in ipairs({ "player", "target" }) do
-        local okExists, exists = pcall(UnitExists, unit)
-        if okExists and exists then
-            add(unit .. ":")
-            local plain = step("UnitHealthPercent (no curve)", UnitHealthPercent, unit)
-            local viaCurve
-            if curve and UnitHealthPercent then
-                viaCurve = step("UnitHealthPercent(unit, false, curve)", UnitHealthPercent, unit, false, curve)
-                if curve.Evaluate then step("curve:Evaluate(secret percent)", curve.Evaluate, curve, plain) end
-            end
-            local secret = viaCurve or plain
-            if secret ~= nil then
-                local okCmp, cmpErr = pcall(function() return secret > 0.5 end)
-                add("  compare secret > 0.5: " .. (okCmp and "allowed" or ("blocked (" .. tostring(cmpErr) .. ")")))
-                local okMath, mathErr = pcall(function() return secret + 1 end)
-                add("  arithmetic on secret: " .. (okMath and "allowed" or ("blocked (" .. tostring(mathErr) .. ")")))
-                local frame = CreateFrame("Frame", nil, UIParent)
-                local fs = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-                local texture = frame:CreateTexture(nil, "OVERLAY")
-                step("frame:SetAlpha(secret)", frame.SetAlpha, frame, secret)
-                step("fontstring:SetAlpha(secret)", fs.SetAlpha, fs, secret)
-                step("texture:SetAlpha(secret)", texture.SetAlpha, texture, secret)
-                step("fontstring:SetText(secret)", fs.SetText, fs, secret)
-                if C_StringUtil and C_StringUtil.FormatNumber then step("FormatNumber(secret)", C_StringUtil.FormatNumber, secret) end
-                if AbbreviateNumbers then step("AbbreviateNumbers(secret)", AbbreviateNumbers, secret) end
-                if fs.SetFormattedText then step("fontstring:SetFormattedText('%s', secret)", fs.SetFormattedText, fs, "%s", secret) end
-                step("frame:GetAlpha() afterwards", frame.GetAlpha, frame)
-            end
-            add("  UnitHealthMissing (secret) into SetText: ")
-            local fs2 = CreateFrame("Frame", nil, UIParent):CreateFontString(nil, "OVERLAY", "GameFontNormal")
-            step("    SetText(UnitHealthMissing)", fs2.SetText, fs2, UnitHealthMissing and UnitHealthMissing(unit))
-            step("    GetText() afterwards", fs2.GetText, fs2)
-        end
-    end
-    return table.concat(out, "\n")
-end
-
--- /spelltips demo: a small movable window that shows whether secret health can drive a display. For each of two
--- units it draws five health bands (0-20%, 20-40%, ...); a band's label is made visible by a curve that the
--- client itself evaluates (UnitHealthPercent with a curve), and its alpha is set from the secret result.
--- Each unit is drawn twice, once with a curve over 0-1 and once over 0-100, because the input scale is not
--- documented: whichever row tracks the real health is the right one. The "missing" figure is the secret
--- missing-HP number drawn as text.
-local demo
-local DEMO_BANDS = { { 0, 0.2 }, { 0.2, 0.4 }, { 0.4, 0.6 }, { 0.6, 0.8 }, { 0.8, 1.0001 } }
-
-local function BuildBandCurve(lo, hi, scale)
-    local curve = C_CurveUtil.CreateCurve()
-    curve:SetType(Enum.LuaCurveType.Step)
-    curve:AddPoint(0, lo <= 0 and 1 or 0)
-    if lo > 0 then curve:AddPoint(lo * scale, 1) end
-    curve:AddPoint(hi * scale, 0)
-    return curve
-end
-
-local function DemoToggle()
-    if demo then
-        demo.frame:SetShown(not demo.frame:IsShown())
-        return
-    end
-    if not (C_CurveUtil and C_CurveUtil.CreateCurve and UnitHealthPercent) then
-        print("[spelltips] this client has no curve helpers; nothing to demo")
-        return
-    end
-    local f = CreateFrame("Frame", "SpellTipsDemo", UIParent)
-    f:SetSize(470, 150)
-    f:SetPoint("CENTER", 0, 220)
-    f:SetFrameStrata("DIALOG")
-    f:SetMovable(true)
-    f:EnableMouse(true)
-    f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart", f.StartMoving)
-    f:SetScript("OnDragStop", f.StopMovingOrSizing)
-    local bg = f:CreateTexture(nil, "BACKGROUND")
-    bg:SetAllPoints()
-    bg:SetColorTexture(0, 0, 0, 0.75)
-    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    title:SetPoint("TOPLEFT", 10, -8)
-    title:SetText("SpellTips demo: bands driven by secret health. Drag to move. /spelltips demo hides it.")
-
-    demo = { frame = f, rows = {}, errorShown = false }
-    local specs = { { "player", 1 }, { "player", 100 }, { "target", 1 }, { "target", 100 } }
-    for i, spec in ipairs(specs) do
-        local row = { unit = spec[1], scale = spec[2], labels = {}, curves = {} }
-        local y = -26 - (i - 1) * 28
-        row.name = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.name:SetPoint("TOPLEFT", 10, y)
-        row.name:SetText(spec[1] .. " curve 0-" .. (spec[2] == 1 and "1" or "100"))
-        for b, band in ipairs(DEMO_BANDS) do
-            local label = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-            label:SetPoint("TOPLEFT", 150 + (b - 1) * 52, y)
-            label:SetText(string.format("%d-%d%%", band[1] * 100, math.min(100, band[2] * 100)))
-            label:SetAlpha(0.15)
-            row.labels[b] = label
-            local ok, curve = pcall(BuildBandCurve, band[1], band[2], spec[2])
-            row.curves[b] = ok and curve or nil
-            if not ok then print("[spelltips] curve build failed: " .. tostring(curve)) end
-        end
-        row.missing = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.missing:SetPoint("TOPLEFT", 420, y)
-        demo.rows[i] = row
-    end
-
-    local elapsed = 0
-    f:SetScript("OnUpdate", function(_, dt)
-        elapsed = elapsed + dt
-        if elapsed < 0.1 then return end
-        elapsed = 0
-        for _, row in ipairs(demo.rows) do
-            local okExists, exists = pcall(UnitExists, row.unit)
-            local present = okExists and exists and true or false
-            row.name:SetAlpha(present and 1 or 0.3)
-            if present then
-                for b, curve in ipairs(row.curves) do
-                    local ok, err = pcall(function() row.labels[b]:SetAlpha(UnitHealthPercent(row.unit, false, curve)) end)
-                    if not ok and not demo.errorShown then
-                        demo.errorShown = true
-                        print("[spelltips] demo: " .. tostring(err))
-                    end
-                end
-                pcall(function()
-                    local missing = UnitHealthMissing(row.unit)
-                    row.missing:SetText(AbbreviateNumbers and AbbreviateNumbers(missing) or missing)
-                end)
-            else
-                for b = 1, #row.labels do row.labels[b]:SetAlpha(0.15) end
-                row.missing:SetText("")
-            end
-        end
-    end)
-end
-
--- /spelltips heal <spell>: a rank label on every party and raid frame. For each known rank of the spell it works
--- out the average heal (spell power and downrank penalty included) and draws a label with that rank's number;
--- the label shows only while the unit's missing health falls where that rank is the best fit (the lowest rank
--- that covers it, the strongest rank if none does). Current health is secret, so the client decides which label
--- is visible: each label's alpha is the result of UnitHealthPercent run through a step curve built from the
--- rank's band. Nothing here reads, compares or does arithmetic on health. /spelltips heal off removes them.
-local heal = { entries = {}, ranks = {}, on = false, dirty = false, sinceRebuild = 99, sinceTick = 0 }
--- Settings live in db.heal: spell ("all" = every heal you know, merged into one ladder; or one spell's name),
--- label ("key" = bound key, else rank; "rank"; "both"), frames ("all", "group" = not your own, "mouse" = only
--- the frame under the cursor), persist (come back after a reload or login), on.
-local HEAL_DEFAULTS = { spell = "all", look = "icon", frames = "all", persist = true, on = false,
-    anchor = "RIGHT", x = -3, y = 0, inside = true, size = 24, preview = true }
-local HEAL_ANCHORS = { "HEALTHBAR", "RIGHT", "LEFT", "TOP", "BOTTOM", "CENTER", "TOPRIGHT", "TOPLEFT", "BOTTOMRIGHT", "BOTTOMLEFT" }
-local HEAL_OPPOSITE = { HEALTHBAR = "LEFT", RIGHT = "LEFT", LEFT = "RIGHT", TOP = "BOTTOM", BOTTOM = "TOP", CENTER = "CENTER",
-    TOPRIGHT = "BOTTOMLEFT", TOPLEFT = "BOTTOMRIGHT", BOTTOMRIGHT = "TOPLEFT", BOTTOMLEFT = "TOPRIGHT" }
-local function HealCfg()
-    db.heal = type(db.heal) == "table" and db.heal or {}
-    for k, v in pairs(HEAL_DEFAULTS) do if db.heal[k] == nil then db.heal[k] = v end end
-    local cfg = db.heal
-    cfg.x, cfg.y = tonumber(cfg.x) or HEAL_DEFAULTS.x, tonumber(cfg.y) or HEAL_DEFAULTS.y
-    cfg.size = math.max(10, math.min(64, tonumber(cfg.size) or HEAL_DEFAULTS.size))
-    if not HEAL_OPPOSITE[cfg.anchor] then cfg.anchor = HEAL_DEFAULTS.anchor end
-    if cfg.look ~= "icon" and cfg.look ~= "both" and cfg.look ~= "key" and cfg.look ~= "rank" then cfg.look = HEAL_DEFAULTS.look end
-    return cfg
-end
-local HEAL_MIN_FRACTION = 0.6  -- no label until missing health reaches this share of the smallest rank's heal
-
--- The key bound to a spell, found on your action bars: a button holding the spell itself, or a macro whose text
--- names the spell and rank ("Healing Touch(Rank 2)"). Slots are mapped to binding names by the stock bar layout.
-local ACTION_BARS = {
-    { 1, "ACTIONBUTTON" }, { 25, "MULTIACTIONBAR3BUTTON" }, { 37, "MULTIACTIONBAR4BUTTON" }, { 49, "MULTIACTIONBAR2BUTTON" },
-    { 61, "MULTIACTIONBAR1BUTTON" }, { 145, "MULTIACTIONBAR5BUTTON" }, { 157, "MULTIACTIONBAR6BUTTON" }, { 169, "MULTIACTIONBAR7BUTTON" },
-}
-
-local function SlotCommand(slot)
-    for _, bar in ipairs(ACTION_BARS) do
-        if slot >= bar[1] and slot < bar[1] + 12 then return bar[2] .. (slot - bar[1] + 1) end
-    end
-end
-
-local function ShortKey(key)
-    key = key:gsub("SHIFT%-", "S"):gsub("CTRL%-", "C"):gsub("ALT%-", "A"):gsub("NUMPAD", "N"):gsub("BUTTON", "M")
-    return key
-end
-
-local function KeyForSpell(spellID, spellName, rankNumber)
-    if not (GetActionInfo and GetBindingKey) then return nil end
-    local plain, spaced
-    if spellName and rankNumber then
-        plain = (spellName .. "(rank " .. rankNumber .. ")"):lower()
-        spaced = (spellName .. " (rank " .. rankNumber .. ")"):lower()
-    end
-    for slot = 1, 180 do
-        local command = SlotCommand(slot)
-        if command then
-            local ok, kind, id = pcall(GetActionInfo, slot)
-            local readable = ok and not (issecretvalue and (issecretvalue(kind) or issecretvalue(id)))
-            local match = false
-            if readable and kind == "spell" and id == spellID then
-                match = true
-            elseif readable and kind == "macro" and plain and GetMacroBody then
-                local okBody, body = pcall(GetMacroBody, id)
-                if okBody and type(body) == "string" then
-                    body = body:lower()
-                    match = body:find(plain, 1, true) ~= nil or body:find(spaced, 1, true) ~= nil
-                end
-            end
-            if match then
-                local key = GetBindingKey(command)
-                if key then return ShortKey(key), slot, kind end
-            end
-        end
-    end
-end
-
-local function Initials(name)
-    local out = ""
-    for word in name:gmatch("%a+") do out = out .. word:sub(1, 1):upper() end
-    return out
-end
-
--- one spell's known ranks as rows { id, avg, number }, weakest first. A spell with no heal line falls back to a
--- damage line when allowDamage is set, so the labels can be tried out on a non-healer.
-local function RankRows(name, allowDamage)
-    local rows = {}
-    for _, id in ipairs(RanksOfSpell(name) or {}) do
-        local sd = Data.AddonData[id]
-        local okKnown, known = pcall(function() return IsSpellKnown == nil or IsSpellKnown(id) end)
-        local line
-        for _, wanted in ipairs(allowDamage and { EFFECT.HEAL, EFFECT.SCHOOL_DAMAGE } or { EFFECT.HEAL }) do
-            for _, k in ipairs(SortedKeys(sd.lines)) do
-                local l = sd.lines[k]
-                if l.type == wanted and (l.coeff or 0) > 0 then line = l break end
-            end
-            if line then break end
-        end
-        if line and okKnown and known then
-            local c = PredictRange(sd, line)
-            local okRank, rankText = pcall(function() return (C_Spell.GetSpellSubtext or GetSpellSubtext)(id) end)
-            rows[#rows + 1] = { id = id, name = sd.name, avg = c.scaled + c.bonus,
-                number = tonumber(okRank and tostring(rankText):match("(%d+)") or nil) }
-        end
-    end
-    table.sort(rows, function(a, b) return a.avg < b.avg end)
-    local seen, clash = {}, false
-    for _, r in ipairs(rows) do
-        if not r.number or seen[r.number] then clash = true end
-        if r.number then seen[r.number] = true end
-    end
-    for i, r in ipairs(rows) do if clash or not r.number then r.number = i end end
-    return rows
-end
-
--- every spell name in Data.lua for your class that has a direct heal and a known rank
-local function KnownHealNames()
-    local classSet, names, seen = PlayerClassSet(), {}, {}
-    for id, sd in pairs(Data.AddonData or {}) do
-        if sd.name and not seen[sd.name] and sd.lines and (sd.classSet == 0 or sd.classSet == classSet) then
-            for _, line in pairs(sd.lines) do
-                if line.type == EFFECT.HEAL and (line.coeff or 0) > 0 then
-                    local okKnown, known = pcall(function() return IsSpellKnown == nil or IsSpellKnown(id) end)
-                    if okKnown and known then seen[sd.name] = true names[#names + 1] = sd.name break end
-                end
-            end
-        end
-    end
-    table.sort(names)
-    return names
-end
-
--- The ladder the labels follow: the chosen spell's ranks, or every known heal's ranks merged and sorted by size.
-local function KnownHealRanks()
-    local cfg = HealCfg()
-    local rows, multi = {}, false
-    if cfg.spell == "all" then
-        local names = KnownHealNames()
-        multi = #names > 1
-        for _, name in ipairs(names) do
-            for _, r in ipairs(RankRows(name, false)) do rows[#rows + 1] = r end
-        end
-        table.sort(rows, function(a, b) return a.avg < b.avg end)
-    else
-        rows = RankRows(cfg.spell, true)
-    end
-    for _, r in ipairs(rows) do
-        local okName, spellName = pcall(C_Spell.GetSpellName, r.id)
-        r.key, r.slot, r.slotKind = KeyForSpell(r.id, okName and spellName or nil, r.number)
-        local rankText = (multi and (Initials(r.name) .. " ") or "") .. "r" .. r.number
-        r.rankText = rankText
-        local okIcon, icon = pcall(function() return (C_Spell.GetSpellTexture or GetSpellTexture)(r.id) end)
-        r.icon = okIcon and icon or nil
-        -- main: the big text; small: the corner text (icon look only)
-        if cfg.look == "icon" then r.main, r.small, r.dim = r.key or ("r" .. r.number), r.key and rankText or nil, not r.key
-        elseif cfg.look == "both" then r.main = (r.key or "-") .. " " .. rankText
-        elseif cfg.look == "rank" then r.main = rankText
-        else r.main = r.key or rankText end
-        r.text = "[" .. ((cfg.look == "both" or cfg.look == "rank") and r.main or (r.key or rankText)) .. "]"
-    end
-    return rows
-end
-
--- Only a real unit frame gets a label: a Button (not a status bar or a texture) at least this big. Buff and
--- debuff icons, cast bars and the bars inside a frame also carry a unit, and must be skipped.
-local HEAL_FRAME_MIN_WIDTH, HEAL_FRAME_MIN_HEIGHT = 60, 25
-
-local function LooksLikeUnitFrame(frame)
-    local okType, isButton = pcall(frame.IsObjectType, frame, "Button")
-    if not (okType and isButton) then return false end
-    local okSize, width, height = pcall(frame.GetSize, frame)
-    if not okSize or type(width) ~= "number" or type(height) ~= "number" then return false end
-    if issecretvalue and (issecretvalue(width) or issecretvalue(height)) then return false end
-    return width >= HEAL_FRAME_MIN_WIDTH and height >= HEAL_FRAME_MIN_HEIGHT
-end
-
-local function HealUnitOf(frame)
-    local okAttr, unit = pcall(frame.GetAttribute, frame, "unit")
-    if not (okAttr and type(unit) == "string") then unit = frame.unit end
-    if type(unit) == "string" and (unit == "player" or unit:match("^party%d$") or unit:match("^raid%d+$")) then return unit end
-end
-
-local function ScanUnitFrames()
-    local found, seen = {}, {}
-    if not EnumerateFrames then return found end
-    local frame = EnumerateFrames()
-    while frame do
-        if not seen[frame] and frame.GetAttribute then
-            seen[frame] = true
-            local unit = HealUnitOf(frame)
-            if unit and (unit ~= "player" or HealCfg().frames ~= "group") and LooksLikeUnitFrame(frame) then
-                found[#found + 1] = { frame = frame, unit = unit }
-            end
-        end
-        frame = EnumerateFrames(frame)
-    end
-    return found
-end
-
--- one step curve per rank: 1 inside the rank's band of health percent (0..1), 0 outside it
-local function BandCurve(pctLow, pctHigh)
-    local curve = C_CurveUtil.CreateCurve()
-    curve:SetType(Enum.LuaCurveType.Step)
-    curve:AddPoint(0, pctLow <= 0 and 1 or 0)
-    if pctLow > 0 then curve:AddPoint(pctLow, 1) end
-    curve:AddPoint(pctHigh, 0)
-    return curve
-end
-
--- The status bar that draws a unit frame's health, so a label can follow the end of its fill. The fill is a texture the
--- engine resizes itself, so anchoring to it needs no health value. Known field names first (Blizzard, oUF, ElvUI...),
--- then the widest status bar among the frame's children.
-function heal.FindHealthBar(frame)
-    local HEALTH_BAR_FIELDS = { "healthBar", "healthbar", "HealthBar", "Health", "health" }
-    local function isBar(candidate)
-        if type(candidate) ~= "table" or not candidate.IsObjectType or not candidate.GetStatusBarTexture then return false end
-        local okType, isStatus = pcall(candidate.IsObjectType, candidate, "StatusBar")
-        return okType and isStatus == true
-    end
-    for _, field in ipairs(HEALTH_BAR_FIELDS) do
-        local candidate = frame[field]
-        if isBar(candidate) then return candidate end
-    end
-    local best, bestWidth = nil, 0
-    local okKids, kids = pcall(function() return { frame:GetChildren() } end)
-    if okKids then
-        for _, kid in ipairs(kids) do
-            if isBar(kid) then
-                local okSize, width = pcall(kid.GetWidth, kid)
-                if okSize and type(width) == "number" and not (issecretvalue and issecretvalue(width)) and width > bestWidth then
-                    best, bestWidth = kid, width
-                end
-            end
-        end
-    end
-    return best
-end
-
-local function HealFont() return STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF" end
-
-local function HealSetFont(fontString, size)
-    if not pcall(fontString.SetFont, fontString, HealFont(), math.max(8, math.floor(size + 0.5)), "OUTLINE") then
-        pcall(fontString.SetFontObject, fontString, GameFontNormal)
-    end
-end
-
--- Where a unit frame's holder sits: anchored inside the frame's edge, or just outside it.
-local function HealPlace(entry)
-    local cfg = HealCfg()
-    local holder = entry.holder
-    if not holder then return end
-    holder:ClearAllPoints()
-    local fill
-    if cfg.anchor == "HEALTHBAR" and entry.bar then
-        local okFill, texture = pcall(entry.bar.GetStatusBarTexture, entry.bar)
-        if okFill and texture then fill = texture end
-    end
-    if fill then
-        -- inside: the label's right edge on the end of the fill; outside: its left edge, over the empty part
-        holder:SetPoint(cfg.inside and "RIGHT" or "LEFT", fill, "RIGHT", cfg.x, cfg.y)
-    else
-        local anchor = cfg.anchor == "HEALTHBAR" and "RIGHT" or cfg.anchor  -- no health bar found: the frame's right edge
-        holder:SetPoint(cfg.inside and anchor or HEAL_OPPOSITE[anchor], entry.frame, anchor, cfg.x, cfg.y)
-    end
-    local size = cfg.size
-    if cfg.look == "icon" then holder:SetSize(size, size) else holder:SetSize(size * 2.6, size * 0.8) end
-end
-
--- Fonts, colors, text and which parts are shown, for every label of an entry. Safe in combat.
-local function HealStyle(entry, ranks)
-    local cfg = HealCfg()
-    local r, g, b = HexToRGB(COLOR.heal)
-    local horizontal = cfg.anchor:find("LEFT") and "LEFT" or (cfg.anchor:find("RIGHT") and "RIGHT" or "CENTER")
-    if cfg.anchor == "HEALTHBAR" then horizontal = cfg.inside and "RIGHT" or "LEFT" end
-    for i, label in ipairs(entry.labels) do
-        local rank = ranks[i]
-        label.active = {}
-        label.icon:Hide() label.key:Hide() label.small:Hide()
-        if label.fill then label.fill:Hide() end
-        if rank then
-            label.key:ClearAllPoints() label.small:ClearAllPoints()
-            local shade = (cfg.look == "icon" and rank.dim) and 0.65 or 1  -- a rank standing in for a missing key is dimmer
-            label.key:SetTextColor(r * shade, g * shade, b * shade)
-            label.small:SetTextColor(r, g, b)
-            if cfg.look == "icon" then
-                if rank.icon then label.icon:SetTexture(rank.icon) end
-                label.icon:SetAllPoints(entry.holder)
-                -- one text, in the top right corner like an action button's hotkey; the rank joins it on big icons
-                HealSetFont(label.key, math.max(9, cfg.size * 0.45))
-                label.key:SetPoint("TOPRIGHT", entry.holder, "TOPRIGHT", -1, -1)
-                label.key:SetText(rank.main)
-                label.active = { label.icon, label.key }
-                if rank.small and cfg.size >= 32 then
-                    HealSetFont(label.small, math.max(9, cfg.size * 0.3))
-                    label.small:SetPoint("BOTTOMRIGHT", entry.holder, "BOTTOMRIGHT", -1, 1)
-                    label.small:SetText(rank.small)
-                    label.active[3] = label.small
-                end
-            else
-                HealSetFont(label.key, cfg.size * 0.6)
-                label.key:SetPoint(horizontal, entry.holder, horizontal, 0, 0)
-                label.key:SetJustifyH(horizontal)
-                label.key:SetText(rank.main)
-                label.active = { label.key }
-            end
-            -- the heal's reach: a segment starting where the bar's fill ends, as wide as this rank's average heal
-            local reach = entry.fillW and entry.fillW[i]
-            if cfg.preview and label.fill and entry.fillTexture and reach and reach > 0 then
-                local fr, fg, fb = HexToRGB(COLOR.healFill)
-                label.fill:SetColorTexture(fr, fg, fb, 0.55)
-                label.fill:ClearAllPoints()
-                label.fill:SetPoint("TOPLEFT", entry.fillTexture, "TOPRIGHT", 0, 0)
-                label.fill:SetPoint("BOTTOMLEFT", entry.fillTexture, "BOTTOMRIGHT", 0, 0)
-                label.fill:SetWidth(reach)
-                label.active[#label.active + 1] = label.fill
-            end
-            for _, region in ipairs(label.active) do region:Show() end
-        end
-    end
-end
-
-local function HealRestyle()
-    for _, entry in ipairs(heal.entries) do
-        HealPlace(entry)
-        HealStyle(entry, heal.ranks)
-        if entry.holder then
-            local canMouse = heal.unlock and not InCombatLockdown()
-            pcall(entry.holder.EnableMouse, entry.holder, canMouse and true or false)
-        end
-    end
-end
-
-local function HealRebuild()
-    local ranks = KnownHealRanks()
-    heal.ranks = ranks
-    heal.cache = heal.cache or {}
-    local known = heal.cache
-    local entries, current = {}, {}
-    for _, found in ipairs(ScanUnitFrames()) do
-        local entry = known[found.frame]
-        if not entry then
-            entry = { frame = found.frame, labels = {}, curves = {} }
-            local ok, holder = pcall(CreateFrame, "Frame", nil, found.frame)
-            if ok and holder then
-                entry.holder = holder
-                pcall(function() holder:SetFrameLevel(found.frame:GetFrameLevel() + 10) end)
-                pcall(function()
-                    holder:RegisterForDrag("LeftButton")
-                    holder:SetScript("OnDragStart", function()
-                        local cx, cy = GetCursorPosition()
-                        local cfg = HealCfg()
-                        heal.drag = { frame = found.frame, cx = cx, cy = cy, x0 = cfg.x, y0 = cfg.y }
-                    end)
-                    holder:SetScript("OnDragStop", function() heal.drag = nil if heal.onMoved then heal.onMoved() end end)
-                end)
-            end
-        end
-        entry.unit = found.unit
-        entry.bar = heal.FindHealthBar(found.frame)
-        entry.fillW = entry.fillW or {}
-        entry.fillTexture = nil
-        if entry.bar then
-            local okFill, texture = pcall(entry.bar.GetStatusBarTexture, entry.bar)
-            if okFill and texture then entry.fillTexture = texture end
-            -- a frame the size of the bar that clips what it holds, so a heal bigger than the missing health is cut at the bar's end
-            if not entry.clip then
-                local okClip, clip = pcall(CreateFrame, "Frame", nil, found.frame)
-                if okClip and clip then
-                    entry.clip = clip
-                    pcall(clip.SetClipsChildren, clip, true)
-                end
-            end
-            if entry.clip then
-                pcall(function()
-                    entry.clip:ClearAllPoints()
-                    entry.clip:SetAllPoints(entry.bar)
-                    entry.clip:SetFrameLevel(entry.bar:GetFrameLevel() + 2)
-                end)
-            end
-        end
-        if entry.holder then
-            for i = #entry.labels + 1, #ranks do
-                local icon = entry.holder:CreateTexture(nil, "OVERLAY")
-                local key = entry.holder:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-                local small = entry.holder:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                entry.labels[i] = { icon = icon, key = key, small = small, active = {} }
-                icon:SetAlpha(0) key:SetAlpha(0) small:SetAlpha(0)
-            end
-            if entry.clip then
-                for _, label in ipairs(entry.labels) do
-                    if not label.fill then
-                        label.fill = entry.clip:CreateTexture(nil, "OVERLAY")
-                        label.fill:SetAlpha(0)
-                    end
-                end
-            end
-            for i = 1, #entry.labels do
-                local rank = ranks[i]
-                entry.curves[i] = nil
-                entry.fillW[i] = nil
-                if rank then
-                    -- band in missing health: from (60% of the smallest heal | the previous rank's average) to this rank's average
-                    local okMax, max = pcall(UnitHealthMax, entry.unit)
-                    if okMax and type(max) == "number" and not (issecretvalue and issecretvalue(max)) and max > 0 then
-                        local lowMissing = (i == 1) and HEAL_MIN_FRACTION * rank.avg or ranks[i - 1].avg
-                        local highMissing = (i == #ranks) and max or rank.avg
-                        local pctLow, pctHigh = math.max(0, 1 - highMissing / max), 1 - lowMissing / max
-                        if pctHigh > pctLow and pctHigh > 0 then
-                            local okCurve, curve = pcall(BandCurve, pctLow, math.min(pctHigh, 1.0001))
-                            entry.curves[i] = okCurve and curve or nil
-                        end
-                        if entry.bar then
-                            local okW, barWidth = pcall(entry.bar.GetWidth, entry.bar)
-                            if okW and type(barWidth) == "number" and not (issecretvalue and issecretvalue(barWidth)) and barWidth > 0 then
-                                entry.fillW[i] = math.min(barWidth, rank.avg / max * barWidth)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        known[found.frame] = entry
-        current[entry] = true
-        entries[#entries + 1] = entry
-    end
-    -- frames no longer wanted (setting changed, frame gone): hide what they carry
-    for _, entry in pairs(known) do
-        if not current[entry] then
-            for _, label in ipairs(entry.labels) do
-                for _, region in ipairs(label.active or {}) do region:SetAlpha(0) end
-            end
-        end
-    end
-    heal.entries = entries
-    HealRestyle()
-    heal.dirty = false
-    heal.sinceRebuild = 0
-end
-
-local function HealSetAlpha(label, alpha)
-    for _, region in ipairs(label.active) do region:SetAlpha(alpha) end
-end
-
-local function HealTick()
-    local cfg = HealCfg()
-    for _, entry in ipairs(heal.entries) do
-        local okShown, shown = pcall(entry.frame.IsShown, entry.frame)
-        local hide = not (okShown and shown)
-        if not heal.unlock then
-            local okDead, dead = pcall(UnitIsDeadOrGhost, entry.unit)
-            if okDead and dead == true then hide = true end
-            if not hide and cfg.frames == "mouse" then
-                local okMouse, over = pcall(entry.frame.IsMouseOver, entry.frame)
-                hide = not (okMouse and over == true)
-            end
-        end
-        for i, label in ipairs(entry.labels) do
-            local curve = entry.curves[i]
-            if hide then
-                HealSetAlpha(label, 0)
-            elseif heal.unlock then
-                HealSetAlpha(label, i == 1 and 1 or 0)  -- while moving, show one label on every frame
-            elseif not curve then
-                HealSetAlpha(label, 0)
-            else
-                local ok = pcall(function() HealSetAlpha(label, UnitHealthPercent(entry.unit, false, curve)) end)
-                if not ok then HealSetAlpha(label, 0) end
-            end
-        end
-    end
-end
-
-local function HealDriver()
-    if heal.driver then return heal.driver end
-    local d = CreateFrame("Frame")
-    for _, event in ipairs({ "GROUP_ROSTER_UPDATE", "PLAYER_REGEN_ENABLED", "UNIT_MAXHEALTH", "SPELLS_CHANGED", "PLAYER_ENTERING_WORLD",
-        "ACTIONBAR_SLOT_CHANGED", "UPDATE_BINDINGS" }) do
-        pcall(d.RegisterEvent, d, event)
-    end
-    d:SetScript("OnEvent", function() heal.dirty = true end)
-    d:SetScript("OnUpdate", function(_, dt)
-        if not heal.on then return end
-        if heal.drag then
-            local cx, cy = GetCursorPosition()
-            local okScale, scale = pcall(heal.drag.frame.GetEffectiveScale, heal.drag.frame)
-            scale = (okScale and type(scale) == "number" and scale > 0) and scale or 1
-            local cfg = HealCfg()
-            cfg.x = math.floor(heal.drag.x0 + (cx - heal.drag.cx) / scale + 0.5)
-            cfg.y = math.floor(heal.drag.y0 + (cy - heal.drag.cy) / scale + 0.5)
-            HealRestyle()
-        end
-        heal.sinceTick = heal.sinceTick + dt
-        heal.sinceRebuild = heal.sinceRebuild + dt
-        if heal.sinceTick >= 0.1 then
-            heal.sinceTick = 0
-            local ok, err = pcall(HealTick)
-            if not ok and not heal.errorShown then heal.errorShown = true print("[spelltips] heal: " .. tostring(err)) end
-        end
-        if not InCombatLockdown() and (heal.dirty or heal.sinceRebuild >= 3) then
-            local ok, err = pcall(HealRebuild)
-            if not ok then
-                heal.sinceRebuild = 0
-                if not heal.errorShown then heal.errorShown = true print("[spelltips] heal: " .. tostring(err)) end
-            end
-        end
-    end)
-    heal.driver = d
-    return d
-end
-
-local HEAL_HELP = "heal commands:\n"
-    .. "  /spelltips heal  (turn on)    /spelltips heal off    /spelltips heal status\n"
-    .. "  /spelltips heal spell all, or a spell name, e.g. Healing Touch\n"
-    .. "  /spelltips heal look icon, key, rank or both\n"
-    .. "  /spelltips heal frames all, group or mouse\n"
-    .. "  /spelltips heal persist on or off\n"
-    .. "  Position, size and color are in the settings window under Heal labels..."
-
-local function HealStart()
-    if not (C_CurveUtil and C_CurveUtil.CreateCurve and UnitHealthPercent) then
-        print("[spelltips] this client has no curve helpers, so heal labels cannot work here")
-        return false
-    end
-    HealDriver()
-    heal.on = true
-    heal.errorShown = false
-    HealCfg().on = true
-    heal.dirty = true
-    return true
-end
-
-local function HealSummary()
-    local cfg = HealCfg()
-    local lines = { "heal labels are " .. (heal.on and "ON" or "OFF") .. " on " .. #heal.entries .. " frames",
-        "  spells: " .. (cfg.spell == "all" and "all my heals" or cfg.spell) .. "   look: " .. cfg.look
-            .. "   frames: " .. cfg.frames .. "   comes back after reload: " .. (cfg.persist and "yes" or "no") }
-    if #heal.ranks == 0 then
-        lines[#lines + 1] = "  no known heals found. To test on a non-healer: /spelltips heal spell Frostbolt"
-    else
-        lines[#lines + 1] = "  label shows when the missing health is about:"
-        local low = HEAL_MIN_FRACTION * heal.ranks[1].avg
-        for i, rank in ipairs(heal.ranks) do
-            local high = heal.ranks[i + 1] and heal.ranks[i].avg or nil
-            lines[#lines + 1] = string.format("    %s   %s   (%s rank %s, spell %s%s)", rank.text,
-                high and (Fmt(low) .. " to " .. Fmt(high)) or (Fmt(low) .. " and up"), rank.name or "?", rank.number, rank.id,
-                rank.slot and (", key from bar slot " .. rank.slot .. " " .. tostring(rank.slotKind)) or ", no key found")
-            low = high or low
-        end
-    end
-    lines[#lines + 1] = "  frames found (" .. #heal.entries .. "):"
-    for _, entry in ipairs(heal.entries) do
-        local frame = entry.frame
-        local okName, name = pcall(frame.GetName, frame)
-        local parent
-        if not (okName and name) then
-            local okParent, p = pcall(frame.GetParent, frame)
-            if okParent and p then
-                local okPName, pName = pcall(p.GetName, p)
-                parent = okPName and pName or nil
-            end
-        end
-        local okShown, shown = pcall(frame.IsShown, frame)
-        lines[#lines + 1] = string.format("    %-8s %-34s %s, health bar %s", tostring(entry.unit),
-            (okName and name) or (parent and ("(in " .. parent .. ")")) or "(unnamed)",
-            (okShown and shown) and "visible" or "hidden", entry.bar and "found" or "not found")
-    end
-    return table.concat(lines, "\n")
-end
-
-local function HealCommand(arg)
-    arg = (arg or ""):match("^%s*(.-)%s*$")
-    local cfg = HealCfg()
-    local word, value = arg:match("^(%S+)%s*(.-)$")
-    word = word and word:lower() or ""
-    local changed = true
-    if word == "off" then
-        heal.on = false
-        cfg.on = false
-        for _, entry in ipairs(heal.entries) do
-            for _, label in ipairs(entry.labels) do label:SetAlpha(0) end
-        end
-        print("[spelltips] heal labels off")
-        return
-    elseif word == "" or word == "on" then
-        changed = false
-    elseif word == "status" then
-        print("[spelltips] " .. HealSummary())
-        return
-    elseif word == "spell" then
-        if value == "" then print("[spelltips] " .. HEAL_HELP) return end
-        cfg.spell = value:lower() == "all" and "all" or value
-    elseif word == "look" or word == "label" then
-        value = value:lower()
-        if value ~= "icon" and value ~= "key" and value ~= "rank" and value ~= "both" then print("[spelltips] " .. HEAL_HELP) return end
-        cfg.look = value
-    elseif word == "frames" then
-        value = value:lower()
-        if value == "mouseover" then value = "mouse" end
-        if value ~= "all" and value ~= "group" and value ~= "mouse" then print("[spelltips] " .. HEAL_HELP) return end
-        cfg.frames = value
-    elseif word == "persist" then
-        value = value:lower()
-        if value ~= "on" and value ~= "off" then print("[spelltips] " .. HEAL_HELP) return end
-        cfg.persist = value == "on"
-        print("[spelltips] heal labels will " .. (cfg.persist and "" or "not ") .. "come back after a reload")
-        return
-    elseif word == "help" or word == "?" then
-        print("[spelltips] " .. HEAL_HELP)
-        return
-    else
-        -- a bare spell name, as in "/spelltips heal Healing Touch"
-        cfg.spell = arg
-    end
-    if not HealStart() then return end
-    if InCombatLockdown() then
-        print("[spelltips] heal labels on; they will be redrawn when combat ends")
-        return
-    end
-    HealRebuild()
-    print("[spelltips] " .. HealSummary())
-end
-
--- Bring the labels back after a reload or login, if they were on and persistence is wanted.
-local function HealResume()
-    local cfg = HealCfg()
-    if not (cfg.on and cfg.persist) then return end
-    HealStart()
-end
-
--- The heal label settings, in plain words: a second window opened from the settings window's "Heal labels..." button.
-local healWindow
-local ANCHOR_NAMES = { HEALTHBAR = "End of the health bar", RIGHT = "Right edge", LEFT = "Left edge", TOP = "Top edge", BOTTOM = "Bottom edge", CENTER = "Center",
-    TOPRIGHT = "Top right corner", TOPLEFT = "Top left corner", BOTTOMRIGHT = "Bottom right corner", BOTTOMLEFT = "Bottom left corner" }
-
-function S.ShowHealSettings()
-    if not healWindow then
-        local w = NewPanel("SpellTipsHealSettings", 480, 566, "Heal labels")
-        healWindow = w
-        w:ClearAllPoints()
-        w:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-        local cfg = HealCfg()
-        local refreshers = {}
-        local function refreshAll() for _, fn in ipairs(refreshers) do fn() end end
-        local function apply()
-            if heal.on then
-                heal.dirty = true
-                if not InCombatLockdown() then pcall(HealRebuild) else pcall(HealRestyle) end
-            end
-        end
-        local function changed() apply() refreshAll() end
-        local function lock()
-            heal.unlock, heal.drag = false, nil
-            pcall(HealRestyle)
-            refreshAll()
-        end
-        w:SetScript("OnHide", lock)
-
-        local intro = w:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        intro:SetPoint("TOPLEFT", 24, -48)
-        intro:SetWidth(432)
-        intro:SetJustifyH("LEFT")
-        intro:SetText("Puts a small label on each unit frame naming the smallest heal that covers the health that "
-            .. "person is missing, so you can pick a rank at a glance. Left-click a button for the next choice, right-click for the previous.")
-
-        refreshers[#refreshers + 1] = CycleRow(w, -100, "Heal labels",
-            function() return { { true, "On" }, { false, "Off" } } end,
-            function() return heal.on == true end,
-            function(v) if v then HealStart() else HealCommand("off") end end,
-            changed)
-
-        refreshers[#refreshers + 1] = CycleRow(w, -134, "Heals to cover",
-            function()
-                local list = { { "all", "All the heals I know" } }
-                local found = false
-                for _, name in ipairs(KnownHealNames()) do
-                    list[#list + 1] = { name, name .. " only" }
-                    if name == cfg.spell then found = true end
-                end
-                if cfg.spell ~= "all" and not found then list[#list + 1] = { cfg.spell, cfg.spell .. " only" } end
-                return list
-            end,
-            function() return cfg.spell end, function(v) cfg.spell = v end, changed)
-
-        refreshers[#refreshers + 1] = CycleRow(w, -168, "Label looks like",
-            function() return { { "icon", "Spell icon, key on it" }, { "both", "Text: key and rank" },
-                { "key", "Text: key, else rank" }, { "rank", "Text: rank only" } } end,
-            function() return cfg.look end, function(v) cfg.look = v end, changed)
-
-        refreshers[#refreshers + 1] = CycleRow(w, -202, "Show on",
-            function() return { { "all", "Every frame, mine too" }, { "group", "Party and raid only" }, { "mouse", "Frame under my mouse" } } end,
-            function() return cfg.frames end, function(v) cfg.frames = v end, changed)
-
-        refreshers[#refreshers + 1] = CycleRow(w, -236, "Attached to",
-            function()
-                local list = {}
-                for _, anchor in ipairs(HEAL_ANCHORS) do list[#list + 1] = { anchor, ANCHOR_NAMES[anchor] } end
-                return list
-            end,
-            function() return cfg.anchor end, function(v) cfg.anchor = v end, changed)
-
-        refreshers[#refreshers + 1] = CycleRow(w, -270, "Sits",
-            function() return { { true, "Inside (on the bar fill)" }, { false, "Outside (past the fill)" } } end,
-            function() return cfg.inside end, function(v) cfg.inside = v end, changed)
-
-        refreshers[#refreshers + 1] = CycleRow(w, -304, "Size",
-            function()
-                local list, found = {}, false
-                for _, size in ipairs({ 14, 18, 22, 24, 28, 32, 40, 48 }) do
-                    list[#list + 1] = { size, size .. " pixels" }
-                    if size == cfg.size then found = true end
-                end
-                if not found then list[#list + 1] = { cfg.size, cfg.size .. " pixels" } end
-                return list
-            end,
-            function() return cfg.size end, function(v) cfg.size = v end, changed)
-
-        refreshers[#refreshers + 1] = CycleRow(w, -338, "After a reload or login",
-            function() return { { true, "Turn back on by itself" }, { false, "Stay off until I turn on" } } end,
-            function() return cfg.persist end, function(v) cfg.persist = v end, function() refreshAll() end)
-
-        -- text color
-        refreshers[#refreshers + 1] = CycleRow(w, -372, "Heal reach on the health bar",
-            function() return { { true, "Show how far it heals" }, { false, "Don't show" } } end,
-            function() return cfg.preview end, function(v) cfg.preview = v end, changed)
-
-        local swatch = NewButton(w, "", 22, nil)
-        swatch:SetSize(22, 22)
-        swatch:SetPoint("TOPLEFT", 24, -412)
-        swatch.texture = swatch:CreateTexture(nil, "OVERLAY")
-        swatch.texture:SetPoint("TOPLEFT", 4, -4)
-        swatch.texture:SetPoint("BOTTOMRIGHT", -4, 4)
-        local function paint()
-            swatch.texture:SetColorTexture(HexToRGB(COLOR.heal))
-            if heal.on then pcall(HealRestyle) end
-        end
-        paint()
-        refreshers[#refreshers + 1] = paint
-        swatch:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-        swatch:SetScript("OnClick", function(_, mouse)
-            if mouse == "RightButton" then
-                db.colors.heal = nil
-                ApplyColors()
-                paint()
-            else
-                PickColor("heal", paint)
-            end
-        end)
-        local swatchText = w:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-        swatchText:SetPoint("LEFT", swatch, "RIGHT", 8, 0)
-        swatchText:SetText("Text color")
-
-        local fillSwatch = NewButton(w, "", 22, nil)
-        fillSwatch:SetSize(22, 22)
-        fillSwatch:SetPoint("TOPLEFT", 244, -412)
-        fillSwatch.texture = fillSwatch:CreateTexture(nil, "OVERLAY")
-        fillSwatch.texture:SetPoint("TOPLEFT", 4, -4)
-        fillSwatch.texture:SetPoint("BOTTOMRIGHT", -4, 4)
-        local function paintFill()
-            fillSwatch.texture:SetColorTexture(HexToRGB(COLOR.healFill))
-            if heal.on then pcall(HealRestyle) end
-        end
-        paintFill()
-        refreshers[#refreshers + 1] = paintFill
-        fillSwatch:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-        fillSwatch:SetScript("OnClick", function(_, mouse)
-            if mouse == "RightButton" then
-                db.colors.healFill = nil
-                ApplyColors()
-                paintFill()
-            else
-                PickColor("healFill", paintFill)
-            end
-        end)
-        local fillText = w:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-        fillText:SetPoint("LEFT", fillSwatch, "RIGHT", 8, 0)
-        fillText:SetText("Heal reach color   (right-click resets either)")
-
-        -- moving
-        local offset = w:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-        offset:SetPoint("TOPLEFT", 24, -452)
-        local moveButton
-        moveButton = NewButton(w, "Move labels", 120, function()
-            if heal.unlock then lock() return end
-            if InCombatLockdown() then print("[spelltips] labels cannot be moved during combat") return end
-            if not heal.on then HealStart() end
-            pcall(HealRebuild)
-            heal.unlock = true
-            pcall(HealRestyle)
-            refreshAll()
-        end)
-        moveButton:SetPoint("TOPLEFT", 24, -474)
-        NewButton(w, "Reset position", 120, function()
-            cfg.anchor, cfg.x, cfg.y, cfg.inside = HEAL_DEFAULTS.anchor, HEAL_DEFAULTS.x, HEAL_DEFAULTS.y, HEAL_DEFAULTS.inside
-            changed()
-        end):SetPoint("LEFT", moveButton, "RIGHT", 10, 0)
-        refreshers[#refreshers + 1] = function()
-            moveButton:SetText(heal.unlock and "Lock labels" or "Move labels")
-            offset:SetText(heal.unlock and "Drag a label with the left mouse button. Every frame follows it. Offset: " .. cfg.x .. ", " .. cfg.y
-                or "Offset from the attach point: " .. cfg.x .. ", " .. cfg.y .. "  (Move labels lets you drag it)")
-        end
-        heal.onMoved = refreshAll
-
-        local note = w:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-        note:SetPoint("BOTTOMLEFT", 24, 18)
-        note:SetWidth(432)
-        note:SetJustifyH("LEFT")
-        note:SetText("The key comes from your action bars (a spell button, or a macro naming the rank). "
-            .. "To try this on a non-healer, type /spelltips heal spell Frostbolt.")
-        w.refreshAll = refreshAll
-    end
-    healWindow.refreshAll()
-    healWindow:Show()
-end
-
 local function EnumListing(filter)
     local out = {}
     local function add(text) out[#out + 1] = text end
@@ -3321,16 +2492,12 @@ local function EnumListing(filter)
     return table.concat(out, "\n")
 end
 
--- an entry in the game's own options screen, if this client has one, that opens the window above
+-- registers the SpellTips page in the game's Options window, if this client has one
 local function RegisterOptionsPage()
     if not (Settings and Settings.RegisterCanvasLayoutCategory and Settings.RegisterAddOnCategory) then return end
-    local page = NewFrame("Frame", nil, UIParent)
-    local text = page:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    text:SetPoint("TOPLEFT", 16, -16)
-    text:SetText("Hold a key over a spell to see the numbers behind it. Type /spelltips any time.")
-    NewButton(page, "Open SpellTips settings", 200, ShowSettings):SetPoint("TOPLEFT", 16, -48)
-    local category = Settings.RegisterCanvasLayoutCategory(page, "SpellTips")
-    Settings.RegisterAddOnCategory(category)
+    optionsPage = BuildOptionsPage()
+    optionsCategory = Settings.RegisterCanvasLayoutCategory(optionsPage, "SpellTips")
+    Settings.RegisterAddOnCategory(optionsCategory)
 end
 
 SLASH_SPELLTIPS1 = "/spelltips"
@@ -3351,36 +2518,6 @@ SlashCmdList["SPELLTIPS"] = function(msg)
         ShowReport()
     elseif word == "probe" then
         ShowCopyText("SpellTips: rank probe", "Press Select all, Ctrl+C, and paste it to the developer.", ProbeListing(rest))
-    elseif word == "pick" then
-        ShowCopyText("SpellTips: rank pick", "Press Select all, Ctrl+C, and paste it to the developer.", PickListing(rest))
-    elseif word == "secrets" then
-        if rest:lower() == "show" then
-            ShowCopyText("SpellTips: health readability", "Press Select all, Ctrl+C, and paste it to the developer.",
-                S.lastSecrets or "Nothing captured yet. Run /spelltips secrets first.")
-        else
-            S.lastSecrets = SecretsSnapshot()
-            if InCombatLockdown() then
-                print("[spelltips] captured in combat. After the fight, run: /spelltips secrets show")
-            else
-                ShowCopyText("SpellTips: health readability", "Press Select all, Ctrl+C, and paste it to the developer.", S.lastSecrets)
-            end
-        end
-    elseif word == "heal" then
-        HealCommand(rest)
-    elseif word == "demo" then
-        DemoToggle()
-    elseif word == "curve" then
-        if rest:lower() == "show" then
-            ShowCopyText("SpellTips: curve probe", "Press Select all, Ctrl+C, and paste it to the developer.",
-                S.lastCurve or "Nothing captured yet. Run /spelltips curve first.")
-        else
-            S.lastCurve = CurveProbe()
-            if InCombatLockdown() then
-                print("[spelltips] captured in combat. After the fight, run: /spelltips curve show")
-            else
-                ShowCopyText("SpellTips: curve probe", "Press Select all, Ctrl+C, and paste it to the developer.", S.lastCurve)
-            end
-        end
     elseif word == "debug" then
         DevDebug()
     elseif word == "verify" then
@@ -3422,7 +2559,6 @@ frame:SetScript("OnEvent", function(self, event, addonName, success)
         LoadSettings()
         pcall(RegisterOptionsPage)
         pcall(RegisterCompartment)
-        pcall(HealResume)
         TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Spell, SafeApply)
         self:UnregisterEvent("ADDON_LOADED")
         local _, first = next(Data.AddonData or {})

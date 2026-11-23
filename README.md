@@ -35,7 +35,7 @@ Weapon abilities show the weapon, attack power and ability parts. Wands show the
 
 ## Settings
 
-Type `/spelltips` (or `/stips`), or click the minimap button. A live preview tooltip appears where your tooltips normally do.
+In the game's Options window under AddOns > SpellTips, or type `/spelltips` (or `/stips`), or click the minimap button. A live preview tooltip appears where your tooltips normally do.
 
 - **Hold key** and **more key**: Alt, Ctrl, Shift or None.
 - **Always shown level**: show numbers or talents without holding a key.
@@ -49,7 +49,7 @@ Settings are saved in `SpellTipsDB`.
 
 | Command | What it does |
 |---------|--------------|
-| `/spelltips` | open the settings window |
+| `/spelltips` | open the SpellTips settings (Options > AddOns > SpellTips) |
 | `/spelltips reset` | reset all settings |
 | `/spelltips minimap` | show or hide the minimap button |
 | `/spelltips report` | text of what the last tooltip showed, to copy |
@@ -57,11 +57,6 @@ Settings are saved in `SpellTipsDB`.
 | `/spelltips desc [spellID]` | where a spell's description text is (developer tool) |
 | `/spelltips debug` | toggle debug output in chat (developer tool) |
 | `/spelltips probe <spell>` | every rank of a spell: learn level, predicted numbers and the game's own text (developer tool) |
-| `/spelltips pick <missing HP> <spell>` | the lowest known healing rank that covers that much missing health (developer tool) |
-| `/spelltips secrets` | whether the client lets addons read health numbers right now; run it in combat, then `/spelltips secrets show` (developer tool) |
-| `/spelltips curve` | whether a secret health number can still drive a display (curve helpers, widgets); run it like `secrets` (developer tool) |
-| `/spelltips demo` | show or hide a small window testing whether secret health can drive a display (developer tool) |
-| `/spelltips heal` | experimental heal labels: on each unit frame, the smallest heal that covers the missing health. Set it up in the settings window, under "Heal labels..."; this command just turns it on, `heal off` turns it off |
 | `/spelltips verify [name]` | check every talent's numbers against the game's own text (developer tool) |
 | `/spelltips ranks <name>` | a talent's text at each rank and the data rows behind it (developer tool) |
 | `/spelltips talent <name or id>` | open the talent window on a talent (developer tool) |
